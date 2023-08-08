@@ -1,5 +1,5 @@
 use crate::{
-    depend::{Conflict, Dependency, Order},
+    depend::{Conflict, Order},
     error::Error,
     job::{IntoJob, Job},
     utility::short_type_name,
@@ -7,29 +7,18 @@ use crate::{
 use parking_lot::{RwLock, RwLockUpgradableReadGuard};
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use std::{
-    any::{type_name, Any},
+    any::type_name,
     collections::HashSet,
-    error,
     num::NonZeroUsize,
     ops::Not,
-    sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc,
-    },
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     thread,
 };
 
-type Runs = Vec<(RwLock<(Run, State)>, Blockers)>;
-type RunResult<T = ()> = Result<T, Box<dyn error::Error + Send + Sync>>;
-
-pub(crate) struct Run {
-    run: Box<dyn FnMut(&mut dyn Any) -> RunResult + Send + Sync>,
-    dependencies: Vec<Dependency>,
-}
+type Jobs = Vec<(RwLock<(Job, State)>, Blockers)>;
 
 #[derive(Debug)]
 struct State {
-    state: Arc<dyn Any + Send + Sync>,
     done: bool,
     error: Option<Error>,
 }
@@ -40,39 +29,18 @@ struct Blockers {
     weak: Vec<(usize, AtomicBool)>,
 }
 
-pub struct Worker {
+pub struct Worker<S> {
     prefix: String,
     schedule: bool,
-    jobs: Vec<Job>,
     control: bool,
-    runs: Runs,
+    jobs: Jobs,
     conflict: Conflict,
     pool: ThreadPool,
+    state: S,
 }
 
-impl Run {
-    pub fn new(
-        mut run: impl FnMut(&mut dyn Any) -> RunResult + Send + Sync + 'static,
-        dependencies: impl IntoIterator<Item = Dependency>,
-    ) -> Self {
-        Self {
-            run: Box::new(move |state| run(state)),
-            dependencies: dependencies.into_iter().collect(),
-        }
-    }
-
-    pub(crate) fn run(&mut self, state: &mut dyn Any) -> RunResult {
-        (self.run)(state)
-    }
-
-    #[inline]
-    pub fn dependencies(&self) -> &[Dependency] {
-        &self.dependencies
-    }
-}
-
-impl Worker {
-    pub fn new(parallelism: Option<NonZeroUsize>) -> Result<Self, Error> {
+impl<S> Worker<S> {
+    pub fn new(state: S, parallelism: Option<NonZeroUsize>) -> Result<Self, Error> {
         let parallelism = parallelism
             .or_else(|| thread::available_parallelism().ok())
             .map(NonZeroUsize::get)
@@ -82,8 +50,8 @@ impl Worker {
             schedule: true,
             jobs: Vec::new(),
             control: false,
-            runs: vec![],
             conflict: Conflict::default(),
+            state,
             pool: ThreadPoolBuilder::new()
                 .num_threads(parallelism)
                 .build()
@@ -91,18 +59,13 @@ impl Worker {
         })
     }
 
-    pub fn push<M, J: IntoJob<M>>(&mut self, job: J) -> Result<(), J::Error>
-    where
-        J::Input: Default,
-    {
-        self.push_with(J::Input::default(), job)
-    }
-
-    pub fn push_with<M, J: IntoJob<M>>(&mut self, input: J::Input, job: J) -> Result<(), J::Error> {
+    pub fn push<J: IntoJob<S>>(&mut self, job: J) -> Result<(), J::Error> {
         self.with_prefix::<J, J::Error, _>(|worker| {
-            let mut job = job.job(input)?;
+            let mut job = job.job(&mut worker.state)?;
             job.name.insert_str(0, &worker.prefix);
-            worker.jobs.push(job);
+            let state = State::new(worker.control);
+            let blockers = Blockers::default();
+            worker.jobs.push(((job, state).into(), blockers));
             worker.schedule = true;
             Ok(())
         })
@@ -113,32 +76,8 @@ impl Worker {
         self.jobs.clear();
     }
 
-    #[inline]
-    pub fn jobs(&self) -> &[Job] {
-        &self.jobs
-    }
-
     pub fn update(&mut self) -> Result<bool, Error> {
         if self.schedule {
-            self.runs = self
-                .jobs
-                .iter_mut()
-                .flat_map(|job| {
-                    job.schedule().into_iter().map(|run| {
-                        (
-                            RwLock::new((
-                                run,
-                                State {
-                                    state: job.state.clone(),
-                                    done: self.control,
-                                    error: None,
-                                },
-                            )),
-                            Blockers::default(),
-                        )
-                    })
-                })
-                .collect();
             self.schedule()?;
             Ok(true)
         } else {
@@ -149,10 +88,10 @@ impl Worker {
     pub fn schedule(&mut self) -> Result<(), Error> {
         // TODO: This algorithm scales poorly (n^2 / 2, where n is the number of runs) and a lot of the work is redundant
         // as shown by the refining part. This could be optimized.
-        let mut runs = &mut self.runs[..];
-        while let Some((tail, rest)) = runs.split_last_mut() {
-            let (run, _) = tail.0.get_mut();
-            self.conflict.detect_inner(&run.dependencies, true)?;
+        let mut jobs = &mut self.jobs[..];
+        while let Some((tail, rest)) = jobs.split_last_mut() {
+            let (job, _) = tail.0.get_mut();
+            self.conflict.detect_inner(&job.dependencies, true)?;
 
             let index = rest.len();
             for (i, rest) in rest.iter_mut().enumerate() {
@@ -167,7 +106,7 @@ impl Worker {
                 }
             }
 
-            runs = rest;
+            jobs = rest;
         }
 
         self.refine_strong_blockers();
@@ -181,7 +120,7 @@ impl Worker {
 
         let Self {
             control,
-            runs,
+            jobs: runs,
             pool,
             ..
         } = self;
@@ -221,7 +160,7 @@ impl Worker {
     /// Since runs are executed in order, for any index that is reserved, all indices smaller than that index represent a run that
     /// is done or in progress (not idle) which is important to prevent a spin loop when waiting for `blockers` to finish.
     /// - This mechanism has a lookahead that is equal to the degree of parallelism which is currently the number of logical CPUs by default.
-    fn progress(index: &AtomicUsize, runs: &Runs, control: bool) -> bool {
+    fn progress(index: &AtomicUsize, runs: &Jobs, control: bool) -> bool {
         loop {
             // `Ordering` doesn't matter here, only atomicity.
             let index = index.fetch_add(1, Ordering::Relaxed);
@@ -242,7 +181,7 @@ impl Worker {
             }
         }
 
-        fn step(index: usize, runs: &Runs, control: bool, lock: bool) -> Option<bool> {
+        fn step(index: usize, runs: &Jobs, control: bool, lock: bool) -> Option<bool> {
             let (run, blockers) = match runs.get(index) {
                 Some(run) => run,
                 None => return Some(true),
@@ -315,8 +254,8 @@ impl Worker {
                 }
 
                 let mut guard = RwLockUpgradableReadGuard::upgrade(guard);
-                let input = as_mut(&mut guard.1.state);
-                let result = guard.0.run(input);
+                let Job { run, state, .. } = &mut guard.0;
+                let result = run(&mut **state);
                 guards.clear();
                 match result {
                     Ok(_) => {
@@ -336,7 +275,7 @@ impl Worker {
 
     /// Remove transitive pre blockers.
     fn refine_strong_blockers(&mut self) {
-        let mut runs = &mut self.runs[..];
+        let mut runs = &mut self.jobs[..];
         let mut set = HashSet::new();
         while let Some(((_, tail), rest)) = runs.split_last_mut() {
             for &(blocker, _, _) in tail.strong.iter() {
@@ -384,7 +323,11 @@ impl Worker {
     }
 }
 
-#[inline]
-pub(crate) fn as_mut<'a, T: ?Sized>(state: &mut Arc<T>) -> &'a mut T {
-    unsafe { &mut *(Arc::as_ptr(&state) as *mut T) }
+impl State {
+    const fn new(control: bool) -> Self {
+        Self {
+            done: control,
+            error: None,
+        }
+    }
 }

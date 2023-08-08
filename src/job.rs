@@ -1,43 +1,45 @@
-use crate::{
-    depend::Dependency,
-    identify,
-    utility::short_type_name,
-    work::{as_mut, Run},
-};
+use crate::{depend::Dependency, utility::short_type_name};
 use std::{
-    any::Any,
     convert::Infallible,
+    error,
     fmt::{self},
-    sync::Arc,
 };
+
+pub trait State: Send + Sync {}
+impl<T: Send + Sync> State for T {}
+
+type Run =
+    Box<dyn FnMut(&mut dyn State) -> Result<(), Box<dyn error::Error + Send + Sync>> + Send + Sync>;
 
 pub struct Job {
-    identifier: usize,
+    pub(crate) run: Run,
+    pub(crate) state: Box<dyn State>,
     pub(crate) name: String,
-    pub(crate) state: Arc<dyn Any + Send + Sync>,
-    schedule: Box<dyn FnMut(&mut dyn Any) -> Vec<Run>>,
+    pub(crate) dependencies: Vec<Dependency>,
 }
 
-pub trait IntoJob<M = ()> {
-    type Input;
+pub trait IntoJob<S> {
     type Error;
-    fn job(self, input: Self::Input) -> Result<Job, Self::Error>;
+    fn job(self, state: &mut S) -> Result<Job, Self::Error>;
+}
+
+unsafe impl Sync for Job {}
+
+impl dyn State {
+    pub fn cast<T>(&mut self) -> &mut T {
+        todo!()
+    }
 }
 
 impl Job {
-    #[inline]
-    pub const fn identifier(&self) -> usize {
-        self.identifier
-    }
-
     #[inline]
     pub fn name(&self) -> &str {
         &self.name
     }
 
-    pub(crate) fn schedule(&mut self) -> Vec<Run> {
-        let state = as_mut(&mut self.state);
-        (self.schedule)(state)
+    #[inline]
+    pub fn dependencies(&self) -> &[Dependency] {
+        &self.dependencies
     }
 }
 
@@ -51,16 +53,15 @@ impl fmt::Debug for Job {
 
 pub struct Barrier;
 
-impl IntoJob for Barrier {
-    type Input = ();
+impl<S> IntoJob<S> for Barrier {
     type Error = Infallible;
 
-    fn job(self, _: Self::Input) -> Result<Job, Self::Error> {
+    fn job(self, _: &mut S) -> Result<Job, Self::Error> {
         Ok(Job {
-            identifier: identify(),
             name: "barrier".into(),
-            state: Arc::new(()),
-            schedule: Box::new(|_| vec![Run::new(|_| Ok(()), [Dependency::Unknown])]),
+            dependencies: vec![Dependency::Unknown],
+            run: Box::new(|_| Ok(())),
+            state: Box::new(()),
         })
     }
 }

@@ -56,12 +56,10 @@ impl Error {
         let mut errors = Vec::new();
         descend(self, &mut errors, recursive);
 
-        if errors.is_empty() {
-            None
-        } else if errors.len() == 1 {
-            Some(errors.into_iter().next().unwrap())
-        } else {
-            Some(Error::All(errors))
+        match errors.len() {
+            0 => None,
+            1 => errors.into_iter().next(),
+            _ => Some(Error::All(errors)),
         }
     }
 }
