@@ -76,6 +76,7 @@ fn boba() -> Result<(), Box<dyn std::error::Error>> {
 pub mod busy_kitchen {
     use std::{
         cell::UnsafeCell,
+        error,
         num::NonZeroUsize,
         sync::atomic::{AtomicU64, AtomicUsize, Ordering::*},
         thread,
@@ -85,11 +86,33 @@ pub mod busy_kitchen {
     use rayon::{Scope, ThreadPool, ThreadPoolBuilder};
 
     use crate::{
-        depend::{Conflict, Order},
+        depend::{Conflict, Dependency, Key, Order},
         error::Error,
         job::Job,
         utility::is_sorted_set,
     };
+
+    #[test]
+    fn boba() -> Result<(), Box<dyn error::Error>> {
+        let mut worker = Worker::new(None)?;
+        for i in 0..100 {
+            worker.push(Job {
+                run: Box::new(|_| Ok(())),
+                state: Box::new(()),
+                name: "A".into(),
+                dependencies: vec![Dependency::Write(
+                    Key::Identifier(if i % 3 == 0 { 1 } else { 2 }),
+                    if i % 7 == 0 {
+                        Order::Strict
+                    } else {
+                        Order::Relax
+                    },
+                )],
+            });
+        }
+        worker.schedule()?;
+        Ok(())
+    }
 
     struct Node {
         pub job: UnsafeCell<Job>,
@@ -211,11 +234,13 @@ pub mod busy_kitchen {
             self.roots.clear();
             self.clusters.clear();
             for node in self.nodes.iter_mut() {
+                node.strong.wait = AtomicUsize::new(0);
                 node.strong.next.clear();
                 node.strong.previous.clear();
                 node.weak = Weak::new();
             }
 
+            // TODO: Scheduling scales poorly with the number of jobs (n^2 / 2).
             for left_index in 0..self.nodes.len() {
                 let (left, right) = self.nodes.split_at_mut(left_index);
                 if let Some((node, right)) = right.split_first_mut() {
@@ -281,26 +306,31 @@ pub mod busy_kitchen {
                             Err(_) => Some(true),
                         };
 
-                        match strong {
-                            Some(true) => {
-                                // Remove transitive strong dependencies.
-                                // TODO: Implement a better linear 'sorted retain' in a separate pass.
-                                for &previous in node.strong.previous.iter() {
-                                    let left = &mut left[previous];
-                                    if let Ok(index) = left.strong.next.binary_search(&right_index)
-                                    {
-                                        left.strong.next.remove(index);
-                                    }
+                        if let Some(strong) = strong {
+                            // Remove transitive strong dependencies.
+                            // TODO: Implement a better linear 'sorted retain' in a separate pass.
+                            for &previous in node.strong.previous.iter() {
+                                let left = &mut left[previous];
+                                if let Ok(next_index) = left.strong.next.binary_search(&right_index)
+                                {
+                                    let Ok(previous_index) =
+                                        right.strong.previous.binary_search(&previous)
+                                    else {
+                                        unreachable!();
+                                    };
+                                    left.strong.next.remove(next_index);
+                                    right.strong.previous.remove(previous_index);
                                 }
+                            }
+
+                            if strong {
                                 node.strong.next.push(right_index);
                                 right.strong.previous.push(left_index);
-                            }
-                            Some(false) => {
+                            } else {
                                 // 'weak.lock' must include its own 'ready' bit.
                                 node.weak.lock |= node.weak.ready | right.weak.ready;
                                 right.weak.lock |= node.weak.ready | right.weak.ready;
                             }
-                            None => {}
                         }
                     }
 
@@ -309,12 +339,12 @@ pub mod busy_kitchen {
                     } else {
                         *node.strong.wait.get_mut() = node.strong.previous.len();
                     }
-
                     debug_assert!(is_sorted_set(&node.strong.previous));
                     debug_assert!(is_sorted_set(&node.strong.next));
                 }
             }
 
+            debug_assert!(is_sorted_set(&self.roots));
             self.schedule = false;
             self.reset = false;
             Ok(())
@@ -432,9 +462,7 @@ pub mod busy_kitchen {
         let mut mask = node.weak.lock & !node.weak.ready;
         let mut ready = ready & mask;
         while ready > 0 {
-            // TODO: Verify from which end 'leading_zeros' start to count.
-            // TODO: Ensure that 'leading_zeros' favors order of declaration.
-            let cluster_index = ready.leading_zeros();
+            let cluster_index = ready.trailing_zeros();
             let node_index = cluster.nodes[cluster_index as usize];
             let node = &worker.nodes[node_index];
             (ready, _) = decompose(match node.weak.late_reserve(&cluster.lock) {

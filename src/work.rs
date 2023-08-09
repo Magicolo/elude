@@ -62,7 +62,7 @@ impl<S> Worker<S> {
     pub fn push<J: IntoJob<S>>(&mut self, job: J) -> Result<(), J::Error> {
         self.with_prefix::<J, J::Error, _>(|worker| {
             let mut job = job.job(&mut worker.state)?;
-            job.name.insert_str(0, &worker.prefix);
+            job.name.to_mut().insert_str(0, &worker.prefix);
             let state = State::new(worker.control);
             let blockers = Blockers::default();
             worker.jobs.push(((job, state).into(), blockers));

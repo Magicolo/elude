@@ -1,5 +1,6 @@
 use crate::{depend::Dependency, utility::short_type_name};
 use std::{
+    borrow::Cow,
     convert::Infallible,
     error,
     fmt::{self},
@@ -14,7 +15,7 @@ type Run =
 pub struct Job {
     pub(crate) run: Run,
     pub(crate) state: Box<dyn State>,
-    pub(crate) name: String,
+    pub(crate) name: Cow<'static, str>,
     pub(crate) dependencies: Vec<Dependency>,
 }
 
