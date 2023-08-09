@@ -157,6 +157,7 @@ impl Conflict {
         };
 
         match (dependency, scope, order) {
+            (_, Outer, _) if self.unknown => Err(UnknownConflict(scope)),
             (Unknown, Inner, _) => Ok(Strict),
             (Unknown, Outer, _) => Err(UnknownConflict(scope)),
 

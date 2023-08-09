@@ -1,57 +1,130 @@
 use crate::{
     depend::{Conflict, Order},
     error::Error,
-    job::{IntoJob, Job},
-    utility::short_type_name,
+    job::Job,
+    utility::is_sorted_set,
 };
-use parking_lot::{RwLock, RwLockUpgradableReadGuard};
-use rayon::{ThreadPool, ThreadPoolBuilder};
+use parking_lot::Mutex;
+use rayon::{Scope, ThreadPool, ThreadPoolBuilder};
 use std::{
-    any::type_name,
-    collections::HashSet,
+    cell::UnsafeCell,
     num::NonZeroUsize,
-    ops::Not,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering::*},
     thread,
 };
 
-type Jobs = Vec<(RwLock<(Job, State)>, Blockers)>;
-
-#[derive(Debug)]
-struct State {
-    done: bool,
-    error: Option<Error>,
+struct Node<'a> {
+    pub job: UnsafeCell<Job<'a>>,
+    pub strong: Strong,
+    pub weak: Weak,
 }
 
-#[derive(Default)]
-struct Blockers {
-    strong: Vec<(usize, AtomicBool, Error)>,
-    weak: Vec<(usize, AtomicBool)>,
+struct Strong {
+    pub wait: AtomicUsize,
+    pub previous: Vec<usize>, // TODO: Node indices could be stored as u32 instead of usize.
+    pub next: Vec<usize>,
 }
 
-pub struct Worker<S> {
-    prefix: String,
+struct Weak {
+    pub ready: u32,
+    pub lock: u32,
+    pub cluster: usize,
+}
+
+struct Cluster {
+    pub bits: AtomicU64,
+    pub nodes: Vec<usize>, // TODO: Based on average size of a cluster, use SmallVec?
+}
+
+pub struct Worker<'a> {
     schedule: bool,
-    control: bool,
-    jobs: Jobs,
+    reset: bool,
+    roots: Vec<usize>,
+    nodes: Vec<Node<'a>>,
+    clusters: Vec<Cluster>,
     conflict: Conflict,
     pool: ThreadPool,
-    state: S,
 }
 
-impl<S> Worker<S> {
-    pub fn new(state: S, parallelism: Option<NonZeroUsize>) -> Result<Self, Error> {
+unsafe impl Sync for Node<'_> {}
+
+impl<'a> Node<'a> {
+    #[inline]
+    pub const fn new(job: Job<'a>) -> Self {
+        Self {
+            job: UnsafeCell::new(job),
+            strong: Strong {
+                wait: AtomicUsize::new(0),
+                previous: Vec::new(),
+                next: Vec::new(),
+            },
+            weak: Weak::new(),
+        }
+    }
+}
+
+impl Weak {
+    #[inline]
+    pub const fn new() -> Self {
+        Self {
+            ready: 0,
+            lock: 0,
+            cluster: usize::MAX,
+        }
+    }
+
+    pub fn early_reserve(&self, bits: &AtomicU64) -> Option<u64> {
+        let mut success = false;
+        let result = bits.fetch_update(Release, Acquire, |bits| {
+            let (ready, lock) = decompose(bits);
+            debug_assert_eq!(self.ready & ready, 0);
+            success = lock & self.lock == 0;
+            if success {
+                // Required locks are available. Take them immediately.
+                Some(recompose(ready, lock | self.lock))
+            } else {
+                // Locks are unavailable. Set the ready bit.
+                Some(recompose(ready | self.ready, lock))
+            }
+        });
+        match result {
+            Ok(bits) if success => Some(bits),
+            Ok(_) | Err(_) => None,
+        }
+    }
+
+    pub fn late_reserve(&self, bits: &AtomicU64) -> Result<u64, u64> {
+        bits.fetch_update(Release, Acquire, |bits| {
+            let (ready, lock) = decompose(bits);
+            if ready & self.ready == self.ready && lock & self.lock == 0 {
+                // Required locks are available. Take them and remove the ready bit.
+                Some(recompose(ready & !self.ready, lock | self.lock))
+            } else {
+                // Locks are unavailable.
+                None
+            }
+        })
+    }
+
+    #[inline]
+    pub fn release(&self, bits: &AtomicU64) -> u64 {
+        bits.fetch_and(recompose(u32::MAX, !self.lock), Relaxed)
+    }
+}
+
+impl<'a> Worker<'a> {
+    pub fn new(parallelism: Option<NonZeroUsize>) -> Result<Self, Error> {
         let parallelism = parallelism
             .or_else(|| thread::available_parallelism().ok())
             .map(NonZeroUsize::get)
             .unwrap_or(0);
         Ok(Self {
-            prefix: String::new(),
             schedule: true,
-            jobs: Vec::new(),
-            control: false,
+            reset: false,
+            roots: Vec::new(),
+            nodes: Vec::new(),
+            clusters: Vec::new(),
             conflict: Conflict::default(),
-            state,
             pool: ThreadPoolBuilder::new()
                 .num_threads(parallelism)
                 .build()
@@ -59,275 +132,304 @@ impl<S> Worker<S> {
         })
     }
 
-    pub fn push<J: IntoJob<S>>(&mut self, job: J) -> Result<(), J::Error> {
-        self.with_prefix::<J, J::Error, _>(|worker| {
-            let mut job = job.job(&mut worker.state)?;
-            job.name.to_mut().insert_str(0, &worker.prefix);
-            let state = State::new(worker.control);
-            let blockers = Blockers::default();
-            worker.jobs.push(((job, state).into(), blockers));
-            worker.schedule = true;
-            Ok(())
-        })
+    pub fn push(&mut self, job: Job<'a>) {
+        self.nodes.push(Node::new(job));
+        self.schedule = true;
     }
 
     pub fn clear(&mut self) {
+        self.nodes.clear();
         self.schedule = true;
-        self.jobs.clear();
     }
 
     pub fn update(&mut self) -> Result<bool, Error> {
         if self.schedule {
             self.schedule()?;
             Ok(true)
+        } else if self.reset {
+            self.reset();
+            Ok(true)
         } else {
             Ok(false)
         }
     }
 
+    pub fn reset(&mut self) {
+        for node in self.nodes.iter_mut() {
+            *node.strong.wait.get_mut() = node.strong.previous.len();
+        }
+        for cluster in self.clusters.iter_mut() {
+            *cluster.bits.get_mut() = 0;
+        }
+        self.reset = false;
+    }
+
     pub fn schedule(&mut self) -> Result<(), Error> {
-        // TODO: This algorithm scales poorly (n^2 / 2, where n is the number of runs) and a lot of the work is redundant
-        // as shown by the refining part. This could be optimized.
-        let mut jobs = &mut self.jobs[..];
-        while let Some((tail, rest)) = jobs.split_last_mut() {
-            let (job, _) = tail.0.get_mut();
-            self.conflict.detect_inner(&job.dependencies, true)?;
-
-            let index = rest.len();
-            for (i, rest) in rest.iter_mut().enumerate() {
-                let pair = rest.0.get_mut();
-                match self.conflict.detect_outer(&pair.0.dependencies, true) {
-                    Ok(Order::Strict) => {}
-                    Ok(Order::Relax) => {
-                        tail.1.weak.push((i, self.control.into()));
-                        rest.1.weak.push((index, self.control.into()));
-                    }
-                    Err(error) => tail.1.strong.push((i, self.control.into(), error)),
-                }
-            }
-
-            jobs = rest;
+        self.roots.clear();
+        self.clusters.clear();
+        for node in self.nodes.iter_mut() {
+            node.strong.wait = AtomicUsize::new(0);
+            node.strong.next.clear();
+            node.strong.previous.clear();
+            node.weak = Weak::new();
         }
 
-        self.refine_strong_blockers();
-        // self.refine_weak_blockers();
+        // TODO: Scheduling scales poorly with the number of jobs (n^2 / 2).
+        for left_index in 0..self.nodes.len() {
+            let (left, right) = self.nodes.split_at_mut(left_index);
+            if let Some((node, right)) = right.split_first_mut() {
+                self.conflict
+                    .detect_inner(node.job.get_mut().dependencies(), true)?;
+
+                for (i, right) in right.iter_mut().enumerate() {
+                    let right_index = left_index + i + 1;
+                    debug_assert!(!node.strong.next.contains(&right_index));
+                    debug_assert!(!right.strong.previous.contains(&left_index));
+
+                    let strong = match self
+                        .conflict
+                        .detect_outer(right.job.get_mut().dependencies(), false)
+                    {
+                        // The nodes have no dependency conflict.
+                        Ok(Order::Strict) => None,
+                        // The nodes have a weak dependency conflict.
+                        Ok(Order::Relax) => {
+                            let clusters = self.clusters.len();
+                            Some(match self.clusters.get_mut(node.weak.cluster) {
+                                // 'node' and 'right' are already in the same cluster.
+                                Some(_) if node.weak.cluster == right.weak.cluster => false,
+                                // 'node' and 'right' are in different clusters.
+                                Some(_) if right.weak.cluster < clusters => true,
+                                // 'node_cluster' is full.
+                                Some(node_cluster) if node_cluster.nodes.len() >= 32 => true,
+                                // 'node' has a cluster and 'right' doesn't.
+                                Some(node_cluster) => {
+                                    right.weak.cluster = node.weak.cluster;
+                                    right.weak.ready = 1 << node_cluster.nodes.len();
+                                    node_cluster.nodes.push(right_index);
+                                    false
+                                }
+                                None => match self.clusters.get_mut(right.weak.cluster) {
+                                    // 'right_cluster' is full.
+                                    Some(right_cluster) if right_cluster.nodes.len() >= 32 => true,
+                                    // 'right' has a cluster and 'node' doesn't.
+                                    Some(right_cluster) => {
+                                        node.weak.cluster = right.weak.cluster;
+                                        node.weak.ready = 1 << right_cluster.nodes.len();
+                                        right_cluster.nodes.push(left_index);
+                                        false
+                                    }
+                                    // 'node' and 'right' don't have a cluster.
+                                    None => {
+                                        node.weak.cluster = clusters;
+                                        right.weak.cluster = clusters;
+                                        node.weak.ready = 1 << 0;
+                                        right.weak.ready = 1 << 1;
+                                        self.clusters.push(Cluster {
+                                            bits: AtomicU64::new(0),
+                                            nodes: vec![left_index, right_index],
+                                        });
+                                        false
+                                    }
+                                },
+                            })
+                        }
+                        // The nodes have a strong dependency conflict.
+                        Err(_) => Some(true),
+                    };
+
+                    if let Some(strong) = strong {
+                        // Remove transitive strong dependencies.
+                        // TODO: Implement a better linear 'sorted retain' in a separate pass.
+
+                        // TODO: WHO SETS THE READY BIT?!
+                        // - Entry points to a cluster can be reduced with the new 'progress_weak'.
+                        // - Can it be set when removing transitive strong dependencies?
+                        for &previous in node.strong.previous.iter() {
+                            let left = &mut left[previous];
+                            if let Ok(next_index) = left.strong.next.binary_search(&right_index) {
+                                let Ok(previous_index) =
+                                        right.strong.previous.binary_search(&previous)
+                                    else {
+                                        unreachable!();
+                                    };
+                                left.strong.next.remove(next_index);
+                                right.strong.previous.remove(previous_index);
+                            }
+                        }
+
+                        if strong {
+                            node.strong.next.push(right_index);
+                            right.strong.previous.push(left_index);
+                        } else {
+                            // 'weak.lock' must include its own 'ready' bit.
+                            node.weak.lock |= node.weak.ready | right.weak.ready;
+                            right.weak.lock |= node.weak.ready | right.weak.ready;
+                        }
+                    }
+                }
+
+                if node.strong.previous.is_empty() {
+                    self.roots.push(left_index);
+                } else {
+                    *node.strong.wait.get_mut() = node.strong.previous.len();
+                }
+                debug_assert!(is_sorted_set(&node.strong.previous));
+                debug_assert!(is_sorted_set(&node.strong.next));
+            }
+        }
+
+        debug_assert!(is_sorted_set(&self.roots));
         self.schedule = false;
+        self.reset = false;
         Ok(())
     }
 
     pub fn run(&mut self) -> Result<(), Error> {
+        // Even if 'run' did not strictly need the '&mut', it must still take it to prevent concurrent runs.
         self.update()?;
 
-        let Self {
-            control,
-            jobs: runs,
-            pool,
-            ..
-        } = self;
-
-        *control = control.not();
-
-        let index = AtomicUsize::new(0);
-        let success = AtomicBool::new(true);
-        let control = *control;
-        pool.scope(|scope| {
-            for _ in 0..pool.current_num_threads() {
-                scope.spawn(|_| {
-                    success.fetch_and(Self::progress(&index, runs, control), Ordering::Relaxed);
-                });
+        let errors = Mutex::new(Vec::new());
+        self.pool.scope(|scope| {
+            for &node in self.roots.iter() {
+                let node = &self.nodes[node];
+                progress(self, node, &errors, scope);
             }
         });
-
-        if success.into_inner() {
-            Ok(())
-        } else {
-            // Err(Error::FailedToRun)
-            Error::All(
-                runs.iter_mut()
-                    .filter_map(|(run, _)| run.get_mut().1.error.take())
-                    .collect(),
-            )
+        let result = Error::All(errors.into_inner())
             .flatten(true)
-            .map_or(Err(Error::FailedToRun), Err)
-        }
-    }
-
-    /// The synchronization mechanism is in 2 parts:
-    /// 1. An `AtomicUsize` is used to reserve an index in the `runs` vector. It ensures that each run is executed only once.
-    /// 2. A `Mutex` around the run and its state that will force the blocked threads to wait until this run is done. This choice
-    /// of synchronization prevents sneaky interleaving of threads and is very straightforward to implement.
-    /// - This mechanism can not produce a dead lock as long as the `blockers` are all indices `< index` (which they are by design).
-    /// Since runs are executed in order, for any index that is reserved, all indices smaller than that index represent a run that
-    /// is done or in progress (not idle) which is important to prevent a spin loop when waiting for `blockers` to finish.
-    /// - This mechanism has a lookahead that is equal to the degree of parallelism which is currently the number of logical CPUs by default.
-    fn progress(index: &AtomicUsize, runs: &Jobs, control: bool) -> bool {
-        loop {
-            // `Ordering` doesn't matter here, only atomicity.
-            let index = index.fetch_add(1, Ordering::Relaxed);
-            match step(index, runs, control, false) {
-                Some(true) => continue,
-                Some(false) => loop {
-                    match step(index, runs, control, true) {
-                        Some(true) => break,
-                        Some(false) => {
-                            if rayon::yield_now().is_none() {
-                                thread::yield_now()
-                            }
-                        }
-                        None => return false,
-                    }
-                },
-                None => return false,
-            }
-        }
-
-        fn step(index: usize, runs: &Jobs, control: bool, lock: bool) -> Option<bool> {
-            let (run, blockers) = match runs.get(index) {
-                Some(run) => run,
-                None => return Some(true),
-            };
-
-            match if lock {
-                Some(run.read())
-            } else {
-                run.try_read()
-            } {
-                Some(guard) if guard.1.done == control => return Some(true),
-                Some(guard) if guard.1.error.is_some() => return None,
-                _ => {}
-            }
-
-            let mut ready = true;
-            for (blocker, done, _) in blockers.strong.iter() {
-                debug_assert!(*blocker < index);
-
-                if done.load(Ordering::Acquire) == control {
-                    continue;
-                }
-
-                // Do not try to `progress` here since if `blocker < index`, it is expected that the blocker index will be
-                // locked by its responsible thread imminently. So this lock should be kept for the least amount of time.
-                match if lock {
-                    Some(runs[*blocker].0.read())
-                } else {
-                    runs[*blocker].0.try_read()
-                } {
-                    Some(guard) if guard.1.done == control => {
-                        done.store(control, Ordering::Release)
-                    }
-                    Some(guard) if guard.1.error.is_some() => return None,
-                    Some(_) | None => ready = false,
-                };
-            }
-
-            // TODO: Reuse a vector?
-            let mut guards = Vec::new();
-            for (blocker, done) in blockers.weak.iter() {
-                if done.load(Ordering::Acquire) == control {
-                    continue;
-                }
-
-                match runs[*blocker].0.try_read() {
-                    Some(guard) if guard.1.done => done.store(control, Ordering::Release),
-                    Some(guard) if guard.1.error.is_some() => return None,
-                    Some(guard) if ready => guards.push(guard),
-                    guard => {
-                        drop(guard);
-                        if !guards.is_empty() {
-                            guards.clear();
-                            ready = false;
-                        } else if step(*blocker, runs, control, false)? {
-                            done.store(control, Ordering::Release);
-                        } else {
-                            ready = false;
-                        }
-                    }
-                };
-            }
-
-            if ready {
-                let guard = run.upgradable_read();
-                if guard.1.done == control {
-                    return Some(true);
-                } else if guard.1.error.is_some() {
-                    return None;
-                }
-
-                let mut guard = RwLockUpgradableReadGuard::upgrade(guard);
-                let Job { run, state, .. } = &mut guard.0;
-                let result = run(&mut **state);
-                guards.clear();
-                match result {
-                    Ok(_) => {
-                        guard.1.done = control;
-                        Some(true)
-                    }
-                    Err(error) => {
-                        guard.1.error = Some(Error::Dynamic(error));
-                        None
-                    }
-                }
-            } else {
-                Some(false)
-            }
-        }
-    }
-
-    /// Remove transitive pre blockers.
-    fn refine_strong_blockers(&mut self) {
-        let mut runs = &mut self.jobs[..];
-        let mut set = HashSet::new();
-        while let Some(((_, tail), rest)) = runs.split_last_mut() {
-            for &(blocker, _, _) in tail.strong.iter() {
-                // `rest[blocker]` ensures that `blocker < rest.len()` which is important when running.
-                let strong = rest[blocker].1.strong.iter();
-                set.extend(strong.map(|&(blocker, _, _)| blocker));
-            }
-            tail.strong.retain(|(blocker, _, _)| !set.contains(blocker));
-            set.clear();
-            runs = rest;
-        }
-    }
-
-    /// Removes the post blockers that have pre blockers later than the current run.
-    // fn refine_weak_blockers(&mut self) {
-    //     let mut runs = &mut self.runs[..];
-    //     let mut index = 0;
-    //     while let Some((head, rest)) = runs.split_first_mut() {
-    //         let (_, state) = head.get_mut();
-    //         index += 1;
-    //         state.weak_blockers.retain(|&(blocker, _)| {
-    //             let (_, next) = rest[blocker - index].get_mut();
-    //             next.strong_blockers
-    //                 .iter()
-    //                 .all(|&(blocker, _, _)| blocker < index)
-    //         });
-    //         runs = rest;
-    //     }
-    // }
-
-    fn with_prefix<T, E, F: FnOnce(&mut Self) -> Result<(), E>>(
-        &mut self,
-        with: F,
-    ) -> Result<(), E> {
-        let count = self.prefix.len();
-        let prefix = if count == 0 {
-            format!("{}::", type_name::<T>())
-        } else {
-            format!("{}::", short_type_name::<T>())
-        };
-        self.prefix.push_str(&prefix);
-        with(self)?;
-        self.prefix.truncate(count);
-        Ok(())
+            .map_or(Ok(()), Err);
+        self.reset = result.is_err();
+        result
     }
 }
 
-impl State {
-    const fn new(control: bool) -> Self {
-        Self {
-            done: control,
-            error: None,
+fn progress<'a, 's>(
+    worker: &'a Worker,
+    node: &'a Node,
+    errors: &'a Mutex<Vec<Error>>,
+    scope: &Scope<'s>,
+) where
+    'a: 's,
+{
+    match worker.clusters.get(node.weak.cluster) {
+        Some(cluster) => {
+            if let Some(bits) = node.weak.early_reserve(&cluster.bits) {
+                // Spawn this job as soon as possible.
+                scope.spawn(|scope| progress_local(worker, node, cluster, errors, scope));
+                // Remove this node's ready bit and lock bits to filter out nodes that would conflict with the current node.
+                let mask = !node.weak.lock & !node.weak.ready;
+                // Try to leverage the ready from 'cluster.bits' to spawn more jobs.
+                progress_weak(worker, bits, mask, cluster, errors, scope);
+            }
+        }
+        None => scope.spawn(|scope| progress_foreign(worker, node, errors, scope)),
+    }
+}
+
+#[inline]
+fn progress_local<'a, 's>(
+    worker: &'a Worker,
+    node: &'a Node,
+    cluster: &'a Cluster,
+    errors: &'a Mutex<Vec<Error>>,
+    scope: &Scope<'s>,
+) where
+    'a: 's,
+{
+    if progress_run(node, errors) {
+        let bits = node.weak.release(&cluster.bits);
+        // Remove this node's ready bit and look for nodes that could have been conflicting with the current node.
+        let mask = node.weak.lock & !node.weak.ready;
+        // Try to leverage the ready bits from 'cluster.bits' to spawn more jobs.
+        progress_weak(worker, bits, mask, cluster, errors, scope);
+        progress_strong(worker, node, errors, scope);
+    }
+}
+
+#[inline]
+fn progress_foreign<'a, 's>(
+    worker: &'a Worker,
+    node: &'a Node,
+    errors: &'a Mutex<Vec<Error>>,
+    scope: &Scope<'s>,
+) where
+    'a: 's,
+{
+    if progress_run(node, errors) {
+        progress_strong(worker, node, errors, scope);
+    }
+}
+
+#[inline]
+fn progress_run<'a, 's>(node: &'a Node, errors: &'a Mutex<Vec<Error>>) -> bool
+where
+    'a: 's,
+{
+    debug_assert_eq!(node.strong.wait.load(Relaxed), 0);
+    debug_assert_eq!(node.weak.lock == 0, node.weak.ready == 0);
+    debug_assert!(node.weak.lock >= node.weak.ready);
+
+    let Job { run, state, .. } = unsafe { &mut *node.job.get() };
+    if let Err(error) = run(&mut **state).map_err(Error::Dynamic) {
+        errors.lock().push(error);
+        false
+    } else {
+        true
+    }
+}
+
+fn progress_strong<'a, 's>(
+    worker: &'a Worker,
+    node: &'a Node,
+    errors: &'a Mutex<Vec<Error>>,
+    scope: &Scope<'s>,
+) where
+    'a: 's,
+{
+    for &node_index in node.strong.next.iter() {
+        let node = &worker.nodes[node_index];
+        if node.strong.wait.fetch_sub(1, Relaxed) == 1 {
+            progress(worker, node, errors, scope);
         }
     }
+    // Reset the state.
+    node.strong.wait.store(node.strong.previous.len(), Relaxed);
+}
+
+fn progress_weak<'a, 's>(
+    worker: &'a Worker,
+    bits: u64,
+    mut mask: u32,
+    cluster: &'a Cluster,
+    errors: &'a Mutex<Vec<Error>>,
+    scope: &Scope<'s>,
+) where
+    'a: 's,
+{
+    let (mut ready, _) = decompose(bits);
+    ready &= mask;
+    while ready > 0 {
+        let cluster_index = ready.trailing_zeros();
+        let node_index = cluster.nodes[cluster_index as usize];
+        let node = &worker.nodes[node_index];
+        (ready, _) = decompose(match node.weak.late_reserve(&cluster.bits) {
+            Ok(bits) => {
+                scope.spawn(|scope| progress_local(worker, node, cluster, errors, scope));
+                bits
+            }
+            Err(bits) => bits,
+        });
+        // Remove this bit from the mask such that it is not retried.
+        mask &= !node.weak.ready;
+        ready &= mask;
+    }
+}
+
+const fn recompose(ready: u32, lock: u32) -> u64 {
+    (ready as u64) << 32 | lock as u64
+}
+
+const fn decompose(bits: u64) -> (u32, u32) {
+    ((bits >> 32) as u32, bits as u32)
 }
