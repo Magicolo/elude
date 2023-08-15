@@ -1,67 +1,82 @@
 use crate::{
-    depend::{Conflict, Order},
+    depend::{Conflict, Dependency, Order},
     error::Error,
+    graph::Graph,
     job::Job,
-    utility::is_sorted_set,
+    utility::{is_sorted_set, sorted_intersects},
 };
 use parking_lot::Mutex;
 use rayon::{Scope, ThreadPool, ThreadPoolBuilder};
 use std::{
     cell::UnsafeCell,
+    collections::HashSet,
+    error,
     num::NonZeroUsize,
     sync::atomic::{AtomicU64, AtomicUsize, Ordering::*},
     thread,
 };
 
-struct Node<'a> {
-    pub job: UnsafeCell<Job<'a>>,
+type RunError = Box<dyn error::Error + Send + Sync>;
+type RunResult = Result<(), RunError>;
+pub(crate) struct Node<'a> {
+    pub run: UnsafeCell<Box<dyn FnMut() -> RunResult + Send + Sync + 'a>>,
+    pub dependencies: Vec<Dependency>,
     pub strong: Strong,
     pub weak: Weak,
 }
 
-struct Strong {
+pub(crate) struct Strong {
     pub wait: AtomicUsize,
     pub previous: Vec<usize>, // TODO: Node indices could be stored as u32 instead of usize.
     pub next: Vec<usize>,
+    pub transitive: HashSet<usize>,
 }
 
-struct Weak {
+pub(crate) struct Weak {
     pub ready: u32,
     pub lock: u32,
     pub cluster: usize,
+    pub rivals: Vec<usize>,
 }
 
-struct Cluster {
+pub(crate) struct Cluster {
+    pub ready: u32,
     pub bits: AtomicU64,
     pub nodes: Vec<usize>, // TODO: Based on average size of a cluster, use SmallVec?
 }
 
+// TODO: Could make `Worker<B: Bits>` to change the size of clusters.
+// - `Bits` would contain methods for atomic operations.
+// - `Bits` would be implemented for `u8, u16, u32` and could be for `u64` for platforms that support AtomicU128.
+// - Should it be implemented on the atomic types instead and be called `Atomic`?
 pub struct Worker<'a> {
+    pub(crate) roots: Vec<usize>,
+    pub(crate) nodes: Vec<Node<'a>>,
+    pub(crate) clusters: Vec<Cluster>,
     schedule: bool,
     reset: bool,
-    roots: Vec<usize>,
-    nodes: Vec<Node<'a>>,
-    clusters: Vec<Cluster>,
     conflict: Conflict,
     pool: ThreadPool,
 }
 
-unsafe impl Sync for Node<'_> {}
-
 impl<'a> Node<'a> {
     #[inline]
-    pub const fn new(job: Job<'a>) -> Self {
+    pub fn new(job: Job<'a>) -> Self {
         Self {
-            job: UnsafeCell::new(job),
+            run: UnsafeCell::new(job.run),
+            dependencies: job.dependencies,
             strong: Strong {
                 wait: AtomicUsize::new(0),
                 previous: Vec::new(),
                 next: Vec::new(),
+                transitive: HashSet::new(),
             },
             weak: Weak::new(),
         }
     }
 }
+
+unsafe impl Sync for Node<'_> {}
 
 impl Weak {
     #[inline]
@@ -70,6 +85,7 @@ impl Weak {
             ready: 0,
             lock: 0,
             cluster: usize::MAX,
+            rivals: Vec::new(),
         }
     }
 
@@ -142,16 +158,17 @@ impl<'a> Worker<'a> {
         self.schedule = true;
     }
 
-    pub fn update(&mut self) -> Result<bool, Error> {
+    pub fn graph(&self) -> Graph<'a, '_> {
+        Graph::new(self)
+    }
+
+    pub fn update(&mut self) -> Result<Graph<'a, '_>, Error> {
         if self.schedule {
             self.schedule()?;
-            Ok(true)
         } else if self.reset {
             self.reset();
-            Ok(true)
-        } else {
-            Ok(false)
         }
+        Ok(self.graph())
     }
 
     pub fn reset(&mut self) {
@@ -164,127 +181,310 @@ impl<'a> Worker<'a> {
         self.reset = false;
     }
 
-    pub fn schedule(&mut self) -> Result<(), Error> {
+    pub fn schedule(&mut self) -> Result<Graph<'a, '_>, Error> {
         self.roots.clear();
         self.clusters.clear();
         for node in self.nodes.iter_mut() {
             node.strong.wait = AtomicUsize::new(0);
             node.strong.next.clear();
             node.strong.previous.clear();
-            node.weak = Weak::new();
+            node.strong.transitive.clear();
+            node.weak.cluster = usize::MAX;
+            node.weak.lock = 0;
+            node.weak.ready = 0;
+            node.weak.rivals.clear();
         }
 
-        // TODO: Scheduling scales poorly with the number of jobs (n^2 / 2).
-        for left_index in 0..self.nodes.len() {
-            let (left, right) = self.nodes.split_at_mut(left_index);
-            if let Some((node, right)) = right.split_first_mut() {
-                self.conflict
-                    .detect_inner(node.job.get_mut().dependencies(), true)?;
+        for i in 0..self.nodes.len() {
+            let (lefts, rights) = self.nodes.split_at_mut(i);
+            if let Some((right, _)) = rights.split_first_mut() {
+                let right = (lefts.len(), right);
+                self.conflict.detect_inner(&right.1.dependencies, true)?;
 
-                for (i, right) in right.iter_mut().enumerate() {
-                    let right_index = left_index + i + 1;
-                    debug_assert!(!node.strong.next.contains(&right_index));
-                    debug_assert!(!right.strong.previous.contains(&left_index));
+                resolve(
+                    (right.0, &mut *right.1),
+                    lefts,
+                    &mut self.conflict,
+                    &mut self.clusters,
+                );
 
-                    let strong = match self
-                        .conflict
-                        .detect_outer(right.job.get_mut().dependencies(), false)
-                    {
-                        // The nodes have no dependency conflict.
-                        Ok(Order::Strict) => None,
-                        // The nodes have a weak dependency conflict.
-                        Ok(Order::Relax) => {
-                            let clusters = self.clusters.len();
-                            Some(match self.clusters.get_mut(node.weak.cluster) {
-                                // 'node' and 'right' are already in the same cluster.
-                                Some(_) if node.weak.cluster == right.weak.cluster => false,
-                                // 'node' and 'right' are in different clusters.
-                                Some(_) if right.weak.cluster < clusters => true,
-                                // 'node_cluster' is full.
-                                Some(node_cluster) if node_cluster.nodes.len() >= 32 => true,
-                                // 'node' has a cluster and 'right' doesn't.
-                                Some(node_cluster) => {
-                                    right.weak.cluster = node.weak.cluster;
-                                    right.weak.ready = 1 << node_cluster.nodes.len();
-                                    node_cluster.nodes.push(right_index);
-                                    false
-                                }
-                                None => match self.clusters.get_mut(right.weak.cluster) {
-                                    // 'right_cluster' is full.
-                                    Some(right_cluster) if right_cluster.nodes.len() >= 32 => true,
-                                    // 'right' has a cluster and 'node' doesn't.
-                                    Some(right_cluster) => {
-                                        node.weak.cluster = right.weak.cluster;
-                                        node.weak.ready = 1 << right_cluster.nodes.len();
-                                        right_cluster.nodes.push(left_index);
-                                        false
-                                    }
-                                    // 'node' and 'right' don't have a cluster.
-                                    None => {
-                                        node.weak.cluster = clusters;
-                                        right.weak.cluster = clusters;
-                                        node.weak.ready = 1 << 0;
-                                        right.weak.ready = 1 << 1;
-                                        self.clusters.push(Cluster {
-                                            bits: AtomicU64::new(0),
-                                            nodes: vec![left_index, right_index],
-                                        });
-                                        false
-                                    }
-                                },
-                            })
-                        }
-                        // The nodes have a strong dependency conflict.
-                        Err(_) => Some(true),
-                    };
-
-                    if let Some(strong) = strong {
-                        // Remove transitive strong dependencies.
-                        // TODO: Implement a better linear 'sorted retain' in a separate pass.
-
-                        // TODO: WHO SETS THE READY BIT?!
-                        // - Entry points to a cluster can be reduced with the new 'progress_weak'.
-                        // - Can it be set when removing transitive strong dependencies?
-                        for &previous in node.strong.previous.iter() {
-                            let left = &mut left[previous];
-                            if let Ok(next_index) = left.strong.next.binary_search(&right_index) {
-                                let Ok(previous_index) =
-                                        right.strong.previous.binary_search(&previous)
-                                    else {
-                                        unreachable!();
-                                    };
-                                left.strong.next.remove(next_index);
-                                right.strong.previous.remove(previous_index);
-                            }
-                        }
-
-                        if strong {
-                            node.strong.next.push(right_index);
-                            right.strong.previous.push(left_index);
-                        } else {
-                            // 'weak.lock' must include its own 'ready' bit.
-                            node.weak.lock |= node.weak.ready | right.weak.ready;
-                            right.weak.lock |= node.weak.ready | right.weak.ready;
-                        }
+                // TODO: Who resets the ready bits?
+                // - Can it be reset after the node is done (similar to strong 'wait')?
+                if right.1.strong.previous.is_empty() {
+                    if let Some(cluster) = self.clusters.get_mut(right.1.weak.cluster) {
+                        cluster.ready |= right.1.weak.ready;
+                        *cluster.bits.get_mut() = recompose(cluster.ready, 0);
                     }
+                    if !sorted_intersects(&self.roots, &right.1.weak.rivals) {
+                        self.roots.push(right.0);
+                    }
+                } else {
+                    *right.1.strong.wait.get_mut() = right.1.strong.previous.len();
                 }
 
-                if node.strong.previous.is_empty() {
-                    self.roots.push(left_index);
-                } else {
-                    *node.strong.wait.get_mut() = node.strong.previous.len();
-                }
-                debug_assert!(is_sorted_set(&node.strong.previous));
-                debug_assert!(is_sorted_set(&node.strong.next));
+                debug_assert!(is_sorted_set(&right.1.strong.next));
+                debug_assert!(is_sorted_set(&right.1.strong.previous));
+                debug_assert!(is_sorted_set(&right.1.weak.rivals));
             }
         }
+        debug_assert!(is_sorted_set(&self.roots));
+
+        // for i in 1..=self.nodes.len() {
+        //     let (lefts, _) = self.nodes.split_at_mut(i);
+        //     if let Some((right, lefts)) = lefts.split_last_mut() {
+        //         let right = (lefts.len(), right);
+        //         self.conflict
+        //             .detect_inner(right.1.job.get_mut().dependencies(), true)?;
+        //         resolve_left(right, lefts, &mut self.conflict, &mut self.clusters);
+        //         continue;
+
+        //         for left in lefts.iter_mut().enumerate().rev() {
+        //             if right.1.strong.transitive.contains(&left.0) {
+        //                 // 'left' and 'right' already have a transitive strong dependency.
+        //                 continue;
+        //             }
+
+        //             let strong = match self
+        //                 .conflict
+        //                 .detect_outer(left.1.job.get_mut().dependencies(), false)
+        //             {
+        //                 // The nodes have no dependency conflict.
+        //                 Ok(Order::Strict) => continue,
+        //                 // The nodes have a weak dependency conflict.
+        //                 Ok(Order::Relax) => {
+        //                     let clusters = self.clusters.len();
+        //                     match self.clusters.get_mut(left.1.weak.cluster) {
+        //                         // 'left' and 'right' are already in the same cluster.
+        //                         Some(_) if left.1.weak.cluster == right.1.weak.cluster => false,
+        //                         // 'left' and 'right' are in different clusters.
+        //                         Some(_) if right.1.weak.cluster < clusters => true,
+        //                         // 'node_cluster' is full.
+        //                         Some(left_cluster) if left_cluster.nodes.len() >= 32 => true,
+        //                         // 'left' has a cluster and 'right' doesn't.
+        //                         Some(left_cluster) => {
+        //                             right.1.weak.cluster = left.1.weak.cluster;
+        //                             right.1.weak.ready = 1 << left_cluster.nodes.len();
+        //                             left_cluster.nodes.push(right.0);
+        //                             false
+        //                         }
+        //                         None => match self.clusters.get_mut(right.1.weak.cluster) {
+        //                             // 'right_cluster' is full.
+        //                             Some(right_cluster) if right_cluster.nodes.len() >= 32 => true,
+        //                             // 'right' has a cluster and 'left' doesn't.
+        //                             Some(right_cluster) => {
+        //                                 left.1.weak.cluster = right.1.weak.cluster;
+        //                                 left.1.weak.ready = 1 << right_cluster.nodes.len();
+        //                                 right_cluster.nodes.push(left.0);
+        //                                 false
+        //                             }
+        //                             // 'left' and 'right' don't have a cluster.
+        //                             None => {
+        //                                 left.1.weak.cluster = clusters;
+        //                                 right.1.weak.cluster = clusters;
+        //                                 left.1.weak.ready = 1 << 0;
+        //                                 right.1.weak.ready = 1 << 1;
+        //                                 self.clusters.push(Cluster {
+        //                                     ready: 0,
+        //                                     bits: AtomicU64::new(0),
+        //                                     nodes: vec![left.0, right.0],
+        //                                 });
+        //                                 false
+        //                             }
+        //                         },
+        //                     }
+        //                 }
+        //                 // The nodes have a strong dependency conflict.
+        //                 Err(_) => true,
+        //             };
+
+        //             if strong {
+        //                 // TODO: This would be the right check if the rivals were already populated...
+        //                 // if !sorted_intersects(&left.1.strong.next, &right.1.weak.rivals) {
+        //                 left.1.strong.next.push(right.0);
+        //                 right.1.strong.previous.push_front(left.0);
+        //                 right.1.strong.transitive.insert(left.0);
+        //                 right
+        //                     .1
+        //                     .strong
+        //                     .transitive
+        //                     .extend(left.1.strong.transitive.iter().copied());
+        //                 // }
+        //             } else {
+        //                 // 'weak.lock' must include its own 'ready' bit.
+        //                 // sorted_difference(&mut left.1.strong.next, &right.1.weak.rivals);
+        //                 left.1.weak.lock |= left.1.weak.ready | right.1.weak.ready;
+        //                 right.1.weak.lock |= left.1.weak.ready | right.1.weak.ready;
+        //                 left.1.weak.rivals.push(right.0);
+        //                 right.1.weak.rivals.push(left.0);
+        //             }
+        //         }
+
+        //         // TODO: Who resets the ready bits?
+        //         // - Can it be reset after the node is done (similar to strong 'wait')?
+        //         if right.1.strong.previous.is_empty() {
+        //             if let Some(cluster) = self.clusters.get_mut(right.1.weak.cluster) {
+        //                 cluster.ready |= right.1.weak.ready;
+        //                 *cluster.bits.get_mut() = recompose(cluster.ready, 0);
+        //             }
+        //             if !sorted_intersects(&self.roots, &right.1.weak.rivals) {
+        //                 self.roots.push(right.0);
+        //             }
+        //         } else {
+        //             *right.1.strong.wait.get_mut() = right.1.strong.previous.len();
+        //         }
+        //     }
+        // }
+
+        // for i in 0..self.nodes.len() {
+        //     let (lefts, _) = self.nodes.split_at_mut(i);
+        //     if let Some((right, lefts)) = lefts.split_last_mut() {
+        //         let right = (lefts.len(), right);
+        //     }
+        // }
+
+        // TODO: Scheduling scales poorly with the number of jobs (n^2 / 2).
+        // for left_index in 0..self.nodes.len() {
+        //     let (_, right) = self.nodes.split_at_mut(left_index);
+        //     if let Some((node, right)) = right.split_first_mut() {
+        //         self.conflict
+        //             .detect_inner(node.job.get_mut().dependencies(), true)?;
+
+        //         for (i, right) in right.iter_mut().enumerate() {
+        //             let right_index = left_index + i + 1;
+        //             debug_assert!(!node.strong.next.contains(&right_index));
+        //             debug_assert!(!right.strong.previous.contains(&left_index));
+
+        //             let strong = match self
+        //                 .conflict
+        //                 .detect_outer(right.job.get_mut().dependencies(), false)
+        //             {
+        //                 // The nodes have no dependency conflict.
+        //                 Ok(Order::Strict) => continue,
+        //                 // The nodes have a weak dependency conflict.
+        //                 Ok(Order::Relax) => {
+        //                     let clusters = self.clusters.len();
+        //                     match self.clusters.get_mut(node.weak.cluster) {
+        //                         // 'node' and 'right' are already in the same cluster.
+        //                         Some(_) if node.weak.cluster == right.weak.cluster => false,
+        //                         // 'node' and 'right' are in different clusters.
+        //                         Some(_) if right.weak.cluster < clusters => true,
+        //                         // 'node_cluster' is full.
+        //                         Some(node_cluster) if node_cluster.nodes.len() >= 32 => true,
+        //                         // 'node' has a cluster and 'right' doesn't.
+        //                         Some(node_cluster) => {
+        //                             right.weak.cluster = node.weak.cluster;
+        //                             right.weak.ready = 1 << node_cluster.nodes.len();
+        //                             node_cluster.nodes.push(right_index);
+        //                             false
+        //                         }
+        //                         None => match self.clusters.get_mut(right.weak.cluster) {
+        //                             // 'right_cluster' is full.
+        //                             Some(right_cluster) if right_cluster.nodes.len() >= 32 => true,
+        //                             // 'right' has a cluster and 'node' doesn't.
+        //                             Some(right_cluster) => {
+        //                                 node.weak.cluster = right.weak.cluster;
+        //                                 node.weak.ready = 1 << right_cluster.nodes.len();
+        //                                 right_cluster.nodes.push(left_index);
+        //                                 false
+        //                             }
+        //                             // 'node' and 'right' don't have a cluster.
+        //                             None => {
+        //                                 node.weak.cluster = clusters;
+        //                                 right.weak.cluster = clusters;
+        //                                 node.weak.ready = 1 << 0;
+        //                                 right.weak.ready = 1 << 1;
+        //                                 self.clusters.push(Cluster {
+        //                                     ready: 0,
+        //                                     bits: AtomicU64::new(0),
+        //                                     nodes: vec![left_index, right_index],
+        //                                 });
+        //                                 false
+        //                             }
+        //                         },
+        //                     }
+        //                 }
+        //                 // The nodes have a strong dependency conflict.
+        //                 Err(_) => true,
+        //             };
+
+        //             if strong {
+        //                 node.strong.next.push(right_index);
+        //                 right.strong.previous.push(left_index);
+        //             } else {
+        //                 // 'weak.lock' must include its own 'ready' bit.
+        //                 node.weak.lock |= node.weak.ready | right.weak.ready;
+        //                 right.weak.lock |= node.weak.ready | right.weak.ready;
+        //                 node.weak.rivals.push(right_index);
+        //                 right.weak.rivals.push(left_index);
+        //             }
+        //         }
+        //     }
+        // }
+
+        // // Remove transitive strong dependencies.
+        // for index in 0..self.nodes.len() {
+        //     let (left, right) = self.nodes.split_at_mut(index);
+        //     if let Some((node, right)) = right.split_first_mut() {
+        //         for &previous in node.strong.previous.iter() {
+        //             // sorted_difference(
+        //             //     &mut left.strong.next,
+        //             //     [&node.strong.next, &node.weak.rivals],
+        //             // );
+        //             // debug_assert!(!sorted_intersects(&left.strong.next, &node.strong.next));
+        //             // debug_assert!(!sorted_intersects(&left.strong.next, &node.weak.rivals));
+        //         }
+
+        //         for &rival in node.weak.rivals.iter() {
+        //             if let Some(rival) = left
+        //                 .get_mut(rival)
+        //                 .or_else(|| right.get_mut(rival - index - 1))
+        //             {
+        //                 // sorted_difference(&mut node.strong.next, [&rival.strong.next]);
+        //                 // sorted_difference(&mut rival.strong.previous, [&node.strong.previous]);
+        //                 // debug_assert!(!sorted_intersects(
+        //                 //     &rival.strong.previous,
+        //                 //     &node.strong.previous
+        //                 // ));
+        //             }
+        //         }
+
+        //         for &next in node.strong.next.iter() {
+        //             let right = &mut right[next - index - 1];
+        //             // sorted_difference(&mut right.strong.previous, [&node.strong.previous]);
+        //             // debug_assert!(!sorted_intersects(
+        //             //     &right.strong.previous,
+        //             //     &node.strong.previous
+        //             // ));
+        //         }
+
+        //         // TODO: Who resets the ready bits?
+        //         // - Can it be reset after the node is done (similar to strong 'wait')?
+        //         if node.strong.previous.is_empty() {
+        //             if let Some(cluster) = self.clusters.get_mut(node.weak.cluster) {
+        //                 cluster.ready |= node.weak.ready;
+        //                 *cluster.bits.get_mut() = recompose(cluster.ready, 0);
+        //             }
+        //             if !sorted_intersects(&self.roots, &node.weak.rivals) {
+        //                 self.roots.push(index);
+        //             }
+        //         } else {
+        //             *node.strong.wait.get_mut() = node.strong.previous.len();
+        //         }
+
+        //         debug_assert!(is_sorted_set(&node.weak.rivals));
+        //         debug_assert!(is_sorted_set(&node.strong.previous));
+        //         debug_assert!(is_sorted_set(&node.strong.next));
+        //     }
+        // }
 
         debug_assert!(is_sorted_set(&self.roots));
         self.schedule = false;
         self.reset = false;
-        Ok(())
+        Ok(Graph::new(self))
     }
+}
 
+impl<'a> Worker<'a> {
     pub fn run(&mut self) -> Result<(), Error> {
         // Even if 'run' did not strictly need the '&mut', it must still take it to prevent concurrent runs.
         self.update()?;
@@ -301,6 +501,102 @@ impl<'a> Worker<'a> {
             .map_or(Ok(()), Err);
         self.reset = result.is_err();
         result
+    }
+}
+
+impl<'a> Extend<Job<'a>> for Worker<'a> {
+    fn extend<T: IntoIterator<Item = Job<'a>>>(&mut self, iter: T) {
+        for job in iter {
+            self.push(job);
+        }
+    }
+}
+
+fn resolve(
+    right: (usize, &mut Node),
+    lefts: &mut [Node],
+    conflict: &mut Conflict,
+    clusters: &mut Vec<Cluster>,
+) {
+    let Some((left, lefts)) = lefts.split_last_mut() else { return; };
+    let left = (lefts.len(), left);
+    if right.1.strong.transitive.contains(&left.0) {
+        // 'left' and 'right' already have a transitive strong dependency.
+        return resolve(right, lefts, conflict, clusters);
+    }
+
+    let strong = match conflict.detect_outer(&left.1.dependencies, false) {
+        // The nodes have no dependency conflict.
+        Ok(Order::Strict) => return resolve(right, lefts, conflict, clusters),
+        // The nodes have a weak dependency conflict.
+        Ok(Order::Relax) => {
+            let count = clusters.len();
+            match clusters.get_mut(left.1.weak.cluster) {
+                // 'left' and 'right' are already in the same cluster.
+                Some(_) if left.1.weak.cluster == right.1.weak.cluster => false,
+                // 'left' and 'right' are in different clusters.
+                Some(_) if right.1.weak.cluster < count => true,
+                // 'node_cluster' is full.
+                Some(left_cluster) if left_cluster.nodes.len() >= 32 => true,
+                // 'left' has a cluster and 'right' doesn't.
+                Some(left_cluster) => {
+                    right.1.weak.cluster = left.1.weak.cluster;
+                    right.1.weak.ready = 1 << left_cluster.nodes.len();
+                    left_cluster.nodes.push(right.0);
+                    false
+                }
+                None => match clusters.get_mut(right.1.weak.cluster) {
+                    // 'right_cluster' is full.
+                    Some(right_cluster) if right_cluster.nodes.len() >= 32 => true,
+                    // 'right' has a cluster and 'left' doesn't.
+                    Some(right_cluster) => {
+                        left.1.weak.cluster = right.1.weak.cluster;
+                        left.1.weak.ready = 1 << right_cluster.nodes.len();
+                        right_cluster.nodes.push(left.0);
+                        false
+                    }
+                    // 'left' and 'right' don't have a cluster.
+                    None => {
+                        left.1.weak.cluster = count;
+                        right.1.weak.cluster = count;
+                        left.1.weak.ready = 1 << 0;
+                        right.1.weak.ready = 1 << 1;
+                        clusters.push(Cluster {
+                            ready: 0,
+                            bits: AtomicU64::new(0),
+                            nodes: vec![left.0, right.0],
+                        });
+                        false
+                    }
+                },
+            }
+        }
+        // The nodes have a strong dependency conflict.
+        Err(_) => true,
+    };
+
+    if strong {
+        right.1.strong.transitive.insert(left.0);
+        right
+            .1
+            .strong
+            .transitive
+            .extend(left.1.strong.transitive.iter().copied());
+    } else {
+        // 'weak.lock' must include its own 'ready' bit.
+        left.1.weak.lock |= left.1.weak.ready | right.1.weak.ready;
+        right.1.weak.lock |= left.1.weak.ready | right.1.weak.ready;
+    }
+
+    resolve((right.0, &mut *right.1), lefts, conflict, clusters);
+
+    // Push the nodes after recursing to preserve ordering.
+    if strong {
+        left.1.strong.next.push(right.0);
+        right.1.strong.previous.push(left.0);
+    } else {
+        left.1.weak.rivals.push(right.0);
+        right.1.weak.rivals.push(left.0);
     }
 }
 
@@ -370,8 +666,8 @@ where
     debug_assert_eq!(node.weak.lock == 0, node.weak.ready == 0);
     debug_assert!(node.weak.lock >= node.weak.ready);
 
-    let Job { run, state, .. } = unsafe { &mut *node.job.get() };
-    if let Err(error) = run(&mut **state).map_err(Error::Dynamic) {
+    let run = unsafe { &mut *node.run.get() };
+    if let Err(error) = run().map_err(Error::Dynamic) {
         errors.lock().push(error);
         false
     } else {
@@ -393,7 +689,8 @@ fn progress_strong<'a, 's>(
             progress(worker, node, errors, scope);
         }
     }
-    // Reset the state.
+
+    // Reset the 'wait' counter after scheduling others.
     node.strong.wait.store(node.strong.previous.len(), Relaxed);
 }
 

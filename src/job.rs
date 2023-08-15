@@ -1,54 +1,57 @@
-use crate::{depend::Dependency, utility::short_type_name};
-use std::{
-    borrow::Cow,
-    error,
-    fmt::{self},
-};
+use crate::depend::Dependency;
+use std::error;
 
-pub trait State: Send + Sync {}
-impl<T: Send + Sync> State for T {}
+type RunError = Box<dyn error::Error + Send + Sync>;
+type RunResult = Result<(), RunError>;
 
-type Error = Box<dyn error::Error + Send + Sync>;
-type Run<'a> = Box<dyn FnMut(&mut dyn State) -> Result<(), Error> + Send + Sync + 'a>;
+pub trait Run {
+    fn run(&mut self) -> RunResult;
+}
 
 pub struct Job<'a> {
-    pub(crate) run: Run<'a>,
-    pub(crate) state: Box<dyn State + 'a>,
-    pub(crate) name: Cow<'static, str>,
+    pub(crate) run: Box<dyn FnMut() -> RunResult + Send + Sync + 'a>,
     pub(crate) dependencies: Vec<Dependency>,
 }
 
-impl dyn State {
-    pub fn cast<T>(&mut self) -> &mut T {
-        todo!()
+impl<'a> Job<'a> {
+    /// # Safety
+    /// This library heavily relies on the fact the `dependencies` are exhaustively declared for the `run` closure.
+    /// Any omitted dependency may lead to undefined behavior.
+    pub unsafe fn new<
+        R: FnMut() -> RunResult + Send + Sync + 'a,
+        D: IntoIterator<Item = Dependency>,
+    >(
+        run: R,
+        dependencies: D,
+    ) -> Self {
+        Self {
+            run: Box::new(run),
+            dependencies: dependencies.into_iter().collect(),
+        }
     }
-}
 
-impl Job<'_> {
-    #[inline]
-    pub fn name(&self) -> &str {
-        &self.name
+    pub fn with<R: FnMut() -> RunResult + Send + Sync + 'a>(run: R) -> Self {
+        unsafe { Self::new(run, []) }
     }
 
-    #[inline]
+    pub fn ok() -> Self {
+        Self::with(|| Ok(()))
+    }
+
+    pub fn barrier() -> Self {
+        Self::ok().depend([Dependency::Unknown])
+    }
+
+    pub fn run(&mut self) -> Result<(), RunError> {
+        (self.run)()
+    }
+
+    pub fn depend<D: IntoIterator<Item = Dependency>>(mut self, dependencies: D) -> Self {
+        self.dependencies.extend(dependencies);
+        self
+    }
+
     pub fn dependencies(&self) -> &[Dependency] {
         &self.dependencies
-    }
-}
-
-impl fmt::Debug for Job<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple(&short_type_name::<Self>())
-            .field(&self.name())
-            .finish()
-    }
-}
-
-pub fn barrier<'a>() -> Job<'a> {
-    Job {
-        name: "barrier".into(),
-        dependencies: vec![Dependency::Unknown],
-        run: Box::new(|_| Ok(())),
-        state: Box::new(()),
     }
 }

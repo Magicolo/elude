@@ -1,6 +1,7 @@
 use std::{
     any::TypeId,
     borrow::Cow,
+    cmp::max,
     collections::{HashMap, HashSet},
     result,
 };
@@ -16,6 +17,7 @@ pub enum Scope {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Key {
     Identifier(usize),
+    Address(usize),
     Type(TypeId),
     Path(Cow<'static, str>),
 }
@@ -46,7 +48,7 @@ pub struct Conflict {
 /// This library heavily relies on the correct implementation of this trait.
 /// Any omitted dependency may lead to undefined behavior.
 pub unsafe trait Depend {
-    type Dependencies: Iterator<Item = Dependency>;
+    type Dependencies: IntoIterator<Item = Dependency>;
     fn depend(&self) -> Self::Dependencies;
 }
 
@@ -106,6 +108,12 @@ impl Conflict {
         let mut allow = Order::Strict;
         let mut errors = Vec::new();
 
+        match self.unknown {
+            true if all => errors.push(Error::UnknownConflict(Scope::Outer)),
+            true => return Err(Error::UnknownConflict(Scope::Outer)),
+            false => {}
+        }
+
         for dependency in dependencies.iter() {
             match self.conflict(Scope::Outer, dependency, false) {
                 Ok(order) => allow = allow.min(order),
@@ -135,11 +143,11 @@ impl Conflict {
         let order = match dependency {
             Read(key, order) | Write(key, order) => match self.orders.get_mut(key) {
                 Some(previous) => {
-                    let current = (*previous).max(*order);
+                    let order = max(*previous, *order);
                     if fill {
-                        *previous = current;
+                        *previous = order;
                     }
-                    current
+                    order
                 }
                 None => {
                     if fill {
@@ -157,7 +165,6 @@ impl Conflict {
         };
 
         match (dependency, scope, order) {
-            (_, Outer, _) if self.unknown => Err(UnknownConflict(scope)),
             (Unknown, Inner, _) => Ok(Strict),
             (Unknown, Outer, _) => Err(UnknownConflict(scope)),
 
@@ -193,5 +200,26 @@ impl Conflict {
             }
             (Write(_, _), Inner, _) | (Write(_, _), _, Strict) => Ok(Strict),
         }
+    }
+}
+
+unsafe impl Depend for () {
+    type Dependencies = [Dependency; 0];
+    fn depend(&self) -> [Dependency; 0] {
+        []
+    }
+}
+
+unsafe impl<T: Depend> Depend for &T {
+    type Dependencies = T::Dependencies;
+    fn depend(&self) -> Self::Dependencies {
+        T::depend(self)
+    }
+}
+
+unsafe impl<T: Depend> Depend for &mut T {
+    type Dependencies = T::Dependencies;
+    fn depend(&self) -> Self::Dependencies {
+        T::depend(self)
     }
 }
