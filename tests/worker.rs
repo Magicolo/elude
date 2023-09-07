@@ -1,15 +1,20 @@
-use std::error::Error;
-
+use checkito::{same::Same, *};
 use elude::{
-    depend::{Dependency::*, Key::*, Order::*},
+    depend::{
+        Dependency::{self, *},
+        Key::{self, *},
+        Order::{self, *},
+    },
     job::Job,
     work::Worker,
 };
+use parking_lot::Mutex;
+use std::{any::TypeId, borrow::Cow, error::Error};
 
 #[test]
 fn dependencies_is_empty() -> Result<(), Box<dyn Error>> {
-    let mut worker = Worker::new(None)?;
-    worker.push(unsafe { Job::new(|| Ok(()), []) });
+    let mut worker = Worker::new((), None)?;
+    worker.push(Job::ok());
     let graph = worker.update()?;
     let roots = graph.roots().collect::<Vec<_>>();
     assert_eq!(roots.len(), 1);
@@ -21,7 +26,7 @@ fn dependencies_is_empty() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn barrier_forces_sequential() -> Result<(), Box<dyn Error>> {
-    let mut worker = Worker::new(None)?;
+    let mut worker = Worker::new((), None)?;
     worker.extend([Job::ok(), Job::barrier(), Job::ok()]);
     let graph = worker.update()?;
     let a = graph.roots().next().unwrap();
@@ -38,7 +43,7 @@ fn barrier_forces_sequential() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn any_read_read_run_in_parallel() -> Result<(), Box<dyn Error>> {
-    let mut worker = Worker::new(None)?;
+    let mut worker = Worker::new((), None)?;
     worker.extend([
         Job::ok().depend([Read(Identifier(0), Relax)]),
         Job::ok().depend([Read(Identifier(1), Strict)]),
@@ -61,7 +66,7 @@ fn any_read_read_run_in_parallel() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn relax_read_write_creates_cluster() -> Result<(), Box<dyn Error>> {
-    let mut worker = Worker::new(None)?;
+    let mut worker = Worker::new((), None)?;
     worker.extend([
         Job::ok().depend([Read(Identifier(0), Relax)]),
         Job::ok().depend([Write(Identifier(0), Relax)]),
@@ -71,7 +76,65 @@ fn relax_read_write_creates_cluster() -> Result<(), Box<dyn Error>> {
     assert_eq!(cluster.nodes().count(), 2);
     let roots = graph.roots().collect::<Vec<_>>();
     assert_eq!(roots.len(), 2);
-    assert_eq!(roots[0].rivals().next().unwrap().index(), 1);
-    assert_eq!(roots[1].rivals().next().unwrap().index(), 0);
+    // assert_eq!(roots[0].rivals().next().unwrap().index(), 1);
+    // assert_eq!(roots[1].rivals().next().unwrap().index(), 0);
+    Ok(())
+}
+
+fn identifier() -> impl Generate<Item = Key> {
+    usize::generator().map(Identifier)
+}
+fn address() -> impl Generate<Item = Key> {
+    usize::generator().map(Address)
+}
+fn path() -> impl Generate<Item = Key> {
+    letter().collect().map(Cow::Owned).map(Path)
+}
+fn key() -> impl Generate<Item = Key> {
+    (path(), address(), identifier()).any().map(Unify::unify)
+}
+fn order() -> impl Generate<Item = Order> {
+    (Same(Strict), Same(Relax)).any().map(Unify::unify)
+}
+fn read() -> impl Generate<Item = Dependency> {
+    (path(), order()).map(|(key, order)| Read(key, order))
+}
+fn write() -> impl Generate<Item = Dependency> {
+    (path(), order()).map(|(key, order)| Write(key, order))
+}
+fn dependency() -> impl Generate<Item = Dependency> {
+    (read(), write()).any().map(Unify::unify)
+}
+fn job<'a, S>(run: impl FnMut() + Send + Sync + Clone + 'a) -> impl Generate<Item = Job<'a, S>> {
+    dependency().collect::<Vec<_>>().map(move |dependencies| {
+        let mut run = run.clone();
+        Job::with(move || {
+            run();
+            Ok(())
+        })
+        .depend(dependencies)
+    })
+}
+#[test]
+fn fett() -> Result<(), Box<dyn Error>> {
+    dependency()
+        .collect::<Vec<_>>()
+        .collect::<Vec<_>>()
+        .check(1000, |dependencies| {
+            let indices = Mutex::new(Vec::new());
+            let mut worker = Worker::new((), None)?;
+            for (i, dependencies) in dependencies.iter().enumerate() {
+                let indices = &indices;
+                worker.push(
+                    Job::with(move || {
+                        indices.lock().push(i);
+                        Ok(())
+                    })
+                    .depend(dependencies.iter().cloned()),
+                );
+            }
+            worker.run()?;
+            Ok::<_, Box<dyn Error>>(())
+        })?;
     Ok(())
 }

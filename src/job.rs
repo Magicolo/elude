@@ -1,24 +1,21 @@
 use crate::depend::Dependency;
 use std::error;
 
-type RunError = Box<dyn error::Error + Send + Sync>;
-type RunResult = Result<(), RunError>;
+pub(crate) type Run<'a, S> = Box<dyn FnMut(&mut S) -> RunResult + Send + Sync + 'a>;
+pub(crate) type RunError = Box<dyn error::Error + Send + Sync>;
+pub(crate) type RunResult = Result<(), RunError>;
 
-pub trait Run {
-    fn run(&mut self) -> RunResult;
-}
-
-pub struct Job<'a> {
-    pub(crate) run: Box<dyn FnMut() -> RunResult + Send + Sync + 'a>,
+pub struct Job<'a, S> {
+    pub(crate) run: Run<'a, S>,
     pub(crate) dependencies: Vec<Dependency>,
 }
 
-impl<'a> Job<'a> {
+impl<'a, S> Job<'a, S> {
     /// # Safety
     /// This library heavily relies on the fact the `dependencies` are exhaustively declared for the `run` closure.
     /// Any omitted dependency may lead to undefined behavior.
     pub unsafe fn new<
-        R: FnMut() -> RunResult + Send + Sync + 'a,
+        R: FnMut(&mut S) -> RunResult + Send + Sync + 'a,
         D: IntoIterator<Item = Dependency>,
     >(
         run: R,
@@ -30,8 +27,8 @@ impl<'a> Job<'a> {
         }
     }
 
-    pub fn with<R: FnMut() -> RunResult + Send + Sync + 'a>(run: R) -> Self {
-        unsafe { Self::new(run, []) }
+    pub fn with<R: FnMut() -> RunResult + Send + Sync + 'a>(mut run: R) -> Self {
+        unsafe { Self::new(move |_| run(), []) }
     }
 
     pub fn ok() -> Self {
@@ -40,10 +37,6 @@ impl<'a> Job<'a> {
 
     pub fn barrier() -> Self {
         Self::ok().depend([Dependency::Unknown])
-    }
-
-    pub fn run(&mut self) -> Result<(), RunError> {
-        (self.run)()
     }
 
     pub fn depend<D: IntoIterator<Item = Dependency>>(mut self, dependencies: D) -> Self {
