@@ -1,7 +1,8 @@
 use std::{
     cell::UnsafeCell,
-    collections::{BTreeMap, HashMap, VecDeque},
-    hint::spin_loop,
+    error::Error,
+    fmt,
+    mem::transmute,
     ops::{Deref, DerefMut},
     ptr::null,
     sync::atomic::{AtomicU32, Ordering::*},
@@ -25,20 +26,32 @@ pub struct Multex<T: ?Sized> {
 #[repr(transparent)]
 struct State(AtomicU32);
 
-pub unsafe trait Mask {
-    fn mask(&self) -> u32;
-}
-
-pub unsafe trait Key<T: ?Sized>: Mask {
+/// Trait that specifies which resources will be locked and what will be returned on a successful lock.
+///
+/// # Safety
+/// An improper implementation of this trait will lead to undefined behavior.
+/// - [`Key::value`] __must__ return only resources that were locked (i.e. that correspond to the [`Key::mask`]).
+pub unsafe trait Key<T: ?Sized> {
     type Value<'a>
     where
         T: 'a;
-    fn value<'a>(&self, value: *mut T) -> Self::Value<'a>;
+    /// Produces a mask where each bit index represents a resource index to lock.
+    fn mask(&self) -> u32;
+    /// Returns the locked resources.
+    unsafe fn value<'a>(&self, value: *mut T) -> Self::Value<'a>
+    where
+        T: 'a;
 }
 
 pub struct Indices<const N: usize> {
     mask: u32,
     indices: [u8; N],
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum IndexError {
+    OutOfBounds(usize),
+    Duplicate(usize),
 }
 
 pub struct All;
@@ -51,67 +64,56 @@ struct Inner<'a>(&'a State, u32);
 unsafe impl<T: Send> Send for Multex<T> {}
 unsafe impl<T: Sync> Sync for Multex<T> {}
 
+impl fmt::Display for IndexError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self, f)
+    }
+}
+impl Error for IndexError {}
+
 impl State {
-    pub fn lock(&self, mask: u32) {
-        // Try to lock optimistically as if there was no contention.
-        let Err(mut state) = self.0.compare_exchange_weak(0, mask, Acquire, Relaxed) else {
-            return;
-        };
-
-        let mut spin = 0;
+    #[inline]
+    pub fn lock(&self, mask: u32) -> u32 {
         loop {
+            match self.try_lock(mask) {
+                Ok(state) => return state,
+                Err(state) => self.wait(state, mask),
+            }
+        }
+    }
+
+    #[inline]
+    pub fn try_lock(&self, mask: u32) -> Result<u32, u32> {
+        self.0.fetch_update(Acquire, Relaxed, |state| {
             if state & mask == 0 {
-                // Try to lock using the previously loaded state.
-                let Err(new) = self.0.compare_exchange_weak(state, state | mask, Acquire, Relaxed) else {
-                    return;
-                };
-                state = new;
-                // The lock was modified or there was a spurious failure; retry.
-                continue;
+                Some(state | mask)
+            } else {
+                None
             }
-            if spin < 100 {
-                spin += 1;
-                state = self.0.load(Relaxed);
-                spin_loop();
-                continue;
-            }
-            self.wait(state, mask);
-            spin = 0;
-            state = self.0.load(Relaxed);
-        }
-    }
-
-    pub fn try_lock(&self, mask: u32) -> bool {
-        // Try to lock optimistically as if there was no contention.
-        let Err(mut state) = self.0.compare_exchange_weak(0, mask, Acquire, Relaxed) else {
-            return true;
-        };
-
-        while state & mask == 0 {
-            // Try to lock using the previously loaded state.
-            let Err(new) = self.0.compare_exchange_weak(state, state | mask, Acquire, Relaxed) else {
-                return true;
-            };
-            state = new;
-            // The lock was modified or there was a spurious failure; retry.
-        }
-        false
+        })
     }
 
     #[inline]
-    pub fn unlock(&self, mask: u32) {
-        self.0.fetch_and(!mask, Release);
+    pub fn unlock(&self, mask: u32) -> u32 {
+        let state = self.0.fetch_and(!mask, Release);
+        self.wake(2, mask);
+        state
+    }
+
+    #[inline]
+    pub fn is_locked(&self, mask: u32) -> bool {
+        self.0.load(Relaxed) & mask != 0
     }
 
     // TODO: Add support for more platforms.
     #[inline]
-    pub fn wait(&self, previous: u32, mask: u32) {
+    pub fn wait(&self, state: u32, mask: u32) {
         unsafe {
             libc::syscall(
                 libc::SYS_futex,
-                self as *const _,
+                self as *const Self,
                 libc::FUTEX_WAIT_BITSET | libc::FUTEX_PRIVATE_FLAG,
-                previous,
+                state,
                 null::<libc::timespec>(),
                 null::<u32>(),
                 mask,
@@ -121,22 +123,30 @@ impl State {
 
     // TODO: Add support for more platforms.
     #[inline]
-    pub fn wake(&self, count: usize, mask: u32) {
+    pub fn wake(&self, count: u32, mask: u32) {
         unsafe {
             libc::syscall(
                 libc::SYS_futex,
-                self as *const _,
+                self as *const Self,
                 libc::FUTEX_WAKE | libc::FUTEX_PRIVATE_FLAG,
-                count as u32,
+                count,
                 null::<libc::timespec>(),
                 null::<u32>(),
                 mask,
             )
         };
+    }
+
+    #[inline]
+    pub fn trim(&self, state: u32, mask: u32) {
+        if state & mask != state {
+            self.0.fetch_and(mask, Release);
+        }
     }
 }
 
 impl<'a, T> Guard<'a, T> {
+    #[inline]
     pub fn map<U, F: FnOnce(T) -> U>(guard: Self, map: F) -> Guard<'a, U> {
         Guard(map(guard.0), guard.1)
     }
@@ -159,14 +169,6 @@ impl<T> DerefMut for Guard<'_, T> {
 impl Drop for Inner<'_> {
     fn drop(&mut self) {
         self.0.unlock(self.1);
-        self.0.wake(1, self.1);
-    }
-}
-
-unsafe impl Mask for All {
-    #[inline]
-    fn mask(&self) -> u32 {
-        u32::MAX
     }
 }
 
@@ -174,7 +176,12 @@ unsafe impl<T> Key<T> for All {
     type Value<'a> = &'a mut T where T: 'a;
 
     #[inline]
-    fn value<'a>(&self, value: *mut T) -> Self::Value<'a>
+    fn mask(&self) -> u32 {
+        u32::MAX
+    }
+
+    #[inline]
+    unsafe fn value<'a>(&self, value: *mut T) -> Self::Value<'a>
     where
         T: 'a,
     {
@@ -182,67 +189,194 @@ unsafe impl<T> Key<T> for All {
     }
 }
 
-unsafe impl<const N: usize> Mask for Indices<N> {
-    #[inline]
-    fn mask(&self) -> u32 {
-        self.mask
-    }
-}
-
 unsafe impl<const N: usize> Key<()> for Indices<N> {
     type Value<'a> = ();
 
     #[inline]
-    fn value<'a>(&self, _: *mut ()) -> Self::Value<'a> {}
+    fn mask(&self) -> u32 {
+        self.mask
+    }
+
+    #[inline]
+    unsafe fn value<'a>(&self, _: *mut ()) -> Self::Value<'a> {}
 }
 
-macro_rules! key {
-    ($t:ty, [$($c:ident)?], [$($r:tt)?]) => {
-        unsafe impl<T $(, const $c: usize)?, const N: usize> Key<$t> for Indices<N> {
-            type Value<'a> = [Option<&'a mut T>; N] where T: 'a;
-            #[inline]
-            fn value<'a>(&self, value: *mut $t) -> Self::Value<'a> {
-                self.indices.map(|index| unsafe { &mut *value }.get_mut($($r)?(index as usize)))
+unsafe impl<T, const N: usize> Key<*mut T> for Indices<N>
+where
+    Indices<N>: Key<T>,
+{
+    type Value<'a> = <Self as Key<T>>::Value<'a> where T: 'a;
+
+    #[inline]
+    fn mask(&self) -> u32 {
+        <Self as Key<T>>::mask(self)
+    }
+
+    #[inline]
+    unsafe fn value<'a>(&self, value: *mut *mut T) -> Self::Value<'a>
+    where
+        T: 'a,
+    {
+        <Self as Key<T>>::value(self, unsafe { value.read() })
+    }
+}
+
+unsafe impl<'b, T, const N: usize> Key<&'b mut T> for Indices<N>
+where
+    Indices<N>: Key<T>,
+{
+    type Value<'a> = <Self as Key<T>>::Value<'a> where 'b: 'a;
+
+    #[inline]
+    fn mask(&self) -> u32 {
+        <Self as Key<T>>::mask(self)
+    }
+
+    #[inline]
+    unsafe fn value<'a>(&self, value: *mut &'b mut T) -> Self::Value<'a>
+    where
+        'b: 'a,
+    {
+        <Self as Key<T>>::value(self, unsafe { value.read() })
+    }
+}
+
+#[repr(C)]
+struct RawSlice<T: ?Sized>(*mut T, usize);
+#[repr(C)]
+struct RawVec<T: ?Sized>(*mut T, usize, usize);
+#[repr(C)]
+struct RawBox<T: ?Sized>(*mut T);
+
+unsafe impl<T, const M: usize, const N: usize> Key<[T; M]> for Indices<N> {
+    type Value<'a> = [Option<&'a mut T>; N] where T: 'a;
+
+    #[inline]
+    fn mask(&self) -> u32 {
+        !u32::MAX.checked_shl(M as _).unwrap_or(0) & self.mask
+    }
+
+    #[inline]
+    unsafe fn value<'a>(&self, value: *mut [T; M]) -> Self::Value<'a>
+    where
+        T: 'a,
+    {
+        let raw = value.cast::<T>();
+        self.indices.map(|index| {
+            let index = index as usize;
+            if index < M {
+                Some(unsafe { &mut *raw.add(index) })
+            } else {
+                None
             }
-        }
-    };
+        })
+    }
 }
 
-key!([T; M], [M], []);
-key!([T], [], []);
-key!(Box<[T]>, [], []);
-key!(Vec<T>, [], []);
-key!(VecDeque<T>, [], []);
-key!(HashMap<usize, T>, [], [&]);
-key!(BTreeMap<usize, T>, [], [&]);
+unsafe impl<T, const N: usize> Key<[T]> for Indices<N> {
+    type Value<'a> = [Option<&'a mut T>; N] where T: 'a;
+
+    #[inline]
+    fn mask(&self) -> u32 {
+        self.mask
+    }
+
+    #[inline]
+    unsafe fn value<'a>(&self, value: *mut [T]) -> Self::Value<'a>
+    where
+        T: 'a,
+    {
+        let raw = unsafe { transmute::<_, RawSlice<T>>(value) };
+        self.indices.map(|index| {
+            let index = index as usize;
+            if index < raw.1 {
+                Some(unsafe { &mut *raw.0.add(index) })
+            } else {
+                None
+            }
+        })
+    }
+}
+
+unsafe impl<T, const M: usize, const N: usize> Key<Box<[T; M]>> for Indices<N> {
+    type Value<'a> = <Self as Key<[T; M]>>::Value<'a> where T: 'a;
+
+    #[inline]
+    fn mask(&self) -> u32 {
+        <Self as Key<[T; M]>>::mask(self)
+    }
+
+    #[inline]
+    unsafe fn value<'a>(&self, value: *mut Box<[T; M]>) -> Self::Value<'a>
+    where
+        T: 'a,
+    {
+        let raw = unsafe { value.cast::<RawBox<[T; M]>>().read() };
+        <Self as Key<[T; M]>>::value(self, raw.0)
+    }
+}
+
+unsafe impl<T, const N: usize> Key<Box<[T]>> for Indices<N> {
+    type Value<'a> = <Self as Key<[T]>>::Value<'a> where T: 'a;
+
+    #[inline]
+    fn mask(&self) -> u32 {
+        <Self as Key<[T]>>::mask(self)
+    }
+
+    #[inline]
+    unsafe fn value<'a>(&self, value: *mut Box<[T]>) -> Self::Value<'a>
+    where
+        T: 'a,
+    {
+        let raw = unsafe { value.cast::<RawBox<[T]>>().read() };
+        <Self as Key<[T]>>::value(self, raw.0)
+    }
+}
+
+unsafe impl<T, const N: usize> Key<Vec<T>> for Indices<N> {
+    type Value<'a> = <Self as Key<[T]>>::Value<'a> where T: 'a;
+
+    #[inline]
+    fn mask(&self) -> u32 {
+        <Self as Key<[T]>>::mask(self)
+    }
+
+    #[inline]
+    unsafe fn value<'a>(&self, value: *mut Vec<T>) -> Self::Value<'a>
+    where
+        T: 'a,
+    {
+        let raw = unsafe { value.cast::<RawVec<T>>().read() };
+        let slice = unsafe { transmute::<_, *mut [T]>(RawSlice(raw.0, raw.2)) };
+        <Self as Key<[T]>>::value(self, slice)
+    }
+}
+
+// TODO: Implement for tuples.
 
 impl<const M: usize> Indices<M> {
-    pub fn new(indices: [usize; M]) -> Option<Self> {
+    pub fn new(indices: [usize; M]) -> Result<Self, IndexError> {
         let mut mask = 0;
         for index in indices {
             if index >= u32::BITS as usize {
                 // Index out of bounds.
-                return None;
+                return Err(IndexError::OutOfBounds(index));
             }
 
             let bit = 1 << index;
             let next = mask | bit;
             if mask == next {
                 // Duplicate index.
-                return None;
+                return Err(IndexError::Duplicate(index));
             } else {
                 mask = next;
             }
         }
-        if mask == 0 {
-            // Mask must not be empty.
-            None
-        } else {
-            Some(Self {
-                indices: indices.map(|index| index as u8),
-                mask,
-            })
-        }
+        Ok(Self {
+            indices: indices.map(|index| index as u8),
+            mask,
+        })
     }
 }
 
@@ -256,77 +390,119 @@ impl<T> Multex<T> {
     }
 
     #[inline]
-    pub fn lock<K: Key<T>>(&self, key: &K) -> Guard<'_, K::Value<'_>> {
-        let mask = key.mask();
-        self.state.lock(mask);
-        let inner = Inner(&self.state, mask);
-        Guard(key.value(self.value.get()), inner)
+    pub const fn as_ptr(&self) -> *const T {
+        self.value.get()
     }
 
     #[inline]
-    pub fn try_lock<K: Key<T>>(&self, key: &K) -> Option<Guard<'_, K::Value<'_>>> {
-        let mask = key.mask();
-        if self.state.try_lock(mask) {
-            let inner = Inner(&self.state, mask);
-            Some(Guard(key.value(self.value.get()), inner))
-        } else {
-            None
-        }
+    pub const fn as_mut_ptr(&self) -> *mut T {
+        self.value.get()
     }
 
     #[inline]
-    pub fn get_mut(&mut self) -> &mut T {
-        self.value.get_mut()
+    pub unsafe fn unlock<K: Key<T>>(&self, key: &K) {
+        self.state.unlock(key.mask());
+    }
+
+    #[inline]
+    pub fn is_locked<K: Key<T>>(&self, key: &K) {
+        self.state.is_locked(key.mask());
+    }
+
+    #[inline]
+    pub fn get_mut<K: Key<T>>(&mut self, key: &K) -> K::Value<'_> {
+        unsafe { key.value(self.value.get_mut()) }
     }
 
     #[inline]
     pub fn into_inner(self) -> T {
         self.value.into_inner()
     }
+
+    #[inline]
+    pub fn lock<K: Key<T>>(&self, key: &K) -> Guard<'_, K::Value<'_>> {
+        let mask = key.mask();
+        self.state.lock(mask);
+        unsafe { self.guard(mask, key) }
+    }
+
+    #[inline]
+    pub fn try_lock<K: Key<T>>(&self, key: &K) -> Option<Guard<'_, K::Value<'_>>> {
+        let mask = key.mask();
+        self.state.try_lock(mask).ok()?;
+        Some(unsafe { self.guard(mask, key) })
+    }
+
+    #[inline]
+    unsafe fn guard<K: Key<T>>(&self, mask: u32, key: &K) -> Guard<'_, K::Value<'_>> {
+        let inner = Inner(&self.state, mask);
+        Guard(key.value(self.value.get()), inner)
+    }
 }
 
 #[test]
-fn locks_different_indices() {
+fn locks_different_indices() -> Result<(), Box<dyn Error>> {
     let multex = Multex::new([1u8, 2u8, 3u8, 4u8]);
-    let key1 = Indices::new([0]).unwrap();
-    let key2 = Indices::new([1]).unwrap();
+    let key1 = Indices::new([0])?;
+    let key2 = Indices::new([1])?;
     let mut guard1 = multex.lock(&key1);
     let mut guard2 = multex.lock(&key2);
-    let Some(value1) = guard1[0].as_mut() else { panic!() };
-    let Some(value2) = guard2[0].as_mut() else { panic!() };
+    let Some(value1) = guard1[0].as_mut() else {
+        panic!()
+    };
+    let Some(value2) = guard2[0].as_mut() else {
+        panic!()
+    };
     assert_eq!(**value1, 1u8);
     assert_eq!(**value2, 2u8);
+    Ok(())
 }
 
 #[test]
-fn boba() {
+fn does_not_contend_on_out_of_bounds_indices() -> Result<(), Box<dyn Error>> {
+    let multex = Multex::new([1u8, 2u8, 3u8, 4u8]);
+    let key1 = Indices::new([0, 4])?;
+    let key2 = Indices::new([1, 4])?;
+    let _guard1 = multex.lock(&key1);
+    let _guard2 = multex.lock(&key2);
+    Ok(())
+}
+
+#[test]
+fn locks_all_without_panic() {
+    Multex::new(Vec::new()).lock(&All).push(1);
+}
+
+#[test]
+fn boba() -> Result<(), Box<dyn Error>> {
     use std::thread::scope;
     use std::thread::sleep;
     use std::time::Duration;
 
-    let values = [(); 11].map(|_| Vec::new());
+    let mut values = [(); 32].map(|_| Vec::new());
     let count = values.len();
-    let multex = Multex::new(values);
-    scope(|scope| {
-        for i in 0..100 {
-            let multex = &multex;
-            let key = Indices::new([i % count]).unwrap();
-            scope.spawn(move || {
-                let mut guard = multex.lock(&key);
-                let Some(value) = &mut guard[0] else { panic!() };
-                value.push(i);
-                println!("ACQUIRE: {i}");
-                sleep(Duration::from_millis(100));
-                println!("RELEASE: {i}");
-                drop(guard);
-            });
-        }
-    });
-    dbg!(multex.into_inner());
-}
+    let multex = Multex::new(&mut values);
 
-fn fett() {
-    type A = Multex<Vec<Multex<[usize; 32]>>>;
-    let a = A::new(Vec::new());
-    a.lock(&All).push(Multex::new([0; 32]));
+    const BATCH: usize = 256;
+    for b in 0.. {
+        scope(|scope| {
+            for i in 0..BATCH {
+                let index = b * BATCH + i;
+                let multex = &multex;
+                let key = Indices::new([index % count])?;
+                scope.spawn(move || {
+                    let mut guard = multex.lock(&key);
+                    let Some(value) = &mut guard[0] else { panic!() };
+                    value.push(index);
+                    println!("ACQUIRE: {index}");
+                    sleep(Duration::from_millis(index as u64 % 17));
+                    println!("RELEASE: {index}");
+                });
+            }
+            Ok::<_, IndexError>(())
+        })?;
+        // dbg!(multex.lock(&All).deref());
+    }
+
+    Ok(())
 }
