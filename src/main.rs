@@ -3,14 +3,14 @@ use std::{
     time::Duration,
 };
 
-use elude::multex::{Indices, Multex};
+use elude::multex::{Indices, Multex64};
 
-const COUNT: usize = 32;
+const COUNT: usize = 64;
 const BATCHES: [usize; 6] = [1, 5, 10, 25, 50, 100];
 const OFFSETS: [usize; 9] = [1, 3, 7, 11, 13, 17, 19, 23, 29];
 
 fn main() {
-    let multex = Multex::new([(); COUNT].map(|_| 0));
+    let multex = Multex64::new([(); COUNT].map(|_| 0));
     let batches = BATCHES.map(|batch| {
         (0..batch)
             .map(|i| Indices::new(OFFSETS.map(|offset| (offset + i) % COUNT)).unwrap())
