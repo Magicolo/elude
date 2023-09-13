@@ -9,6 +9,7 @@ edition = "2021"
 parking_lot = { version = "*", features = ["deadlock_detection"] }
 rayon = "*"
 libc = "*"
+windows-sys = { version = "*", features = ["Win32_System_Threading", "Win32_Foundation"] }
 
 [dev-dependencies]
 checkito = "1.3.8"
@@ -17,7 +18,3 @@ criterion = "*"
 [[bench]]
 name = "multex"
 harness = false
-
-[profile.release]
-debug = true
-opt-level = 0

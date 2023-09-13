@@ -9,7 +9,7 @@ use elude::{
     work::Worker,
 };
 use parking_lot::Mutex;
-use std::{any::TypeId, borrow::Cow, error::Error};
+use std::{borrow::Cow, error::Error};
 
 #[test]
 fn dependencies_is_empty() -> Result<(), Box<dyn Error>> {
