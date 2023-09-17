@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use elude::multex::{Indices, Multex64};
+use elude::multex::{AtN, Multex64};
 use rayon::ThreadPoolBuilder;
 
 const COUNT: usize = usize::BITS as usize;
@@ -78,7 +78,9 @@ fn multex(criterion: &mut Criterion) {
                 let pool = ThreadPoolBuilder::new().build().unwrap();
                 let multex = Multex64::new([(); COUNT].map(|_| 0));
                 let batches = (0..batch)
-                    .map(|i| Indices::new(OFFSETS.map(|offset| (offset + i) % COUNT)).unwrap())
+                    .map(|i| {
+                        AtN::<_, [_; 7]>::new(OFFSETS.map(|offset| (offset + i) % COUNT)).unwrap()
+                    })
                     .collect::<Box<[_]>>();
                 bencher.iter(|| {
                     pool.scope(|scope| {
@@ -86,7 +88,7 @@ fn multex(criterion: &mut Criterion) {
                         for (i, key) in batches.iter().enumerate() {
                             scope.spawn(move |_| {
                                 for _ in 0..ITERATIONS {
-                                    let mut guard = multex.lock(key);
+                                    let mut guard = multex.lock_with(key, false);
                                     for guard in guard.iter_mut() {
                                         **guard.as_mut().unwrap() += i;
                                     }
