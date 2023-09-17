@@ -2,7 +2,6 @@ pub mod depend;
 pub mod error;
 pub mod graph;
 pub mod job;
-pub mod multex;
 mod utility;
 pub mod work;
 
