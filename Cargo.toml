@@ -8,6 +8,7 @@ edition = "2021"
 [dependencies]
 parking_lot = { version = "*", features = ["deadlock_detection"] }
 rayon = "*"
+anyhow = "*"
 
 [dev-dependencies]
 checkito = "1.3.8"

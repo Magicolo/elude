@@ -13,7 +13,6 @@ use crate::{
     depend::{Dependency, Key, Order},
     job::Job,
 };
-use job::RunResult;
 use std::marker::PhantomData;
 use work::Build;
 
@@ -77,7 +76,7 @@ impl<S, T, F: Fn(&S) -> &T> Build<'_, '_, S, &T, F> {
 // }
 
 impl<'a, S: Send + Sync + 'a, T, F: Fn(&S) -> &T + Send + Sync + 'a> Build<'a, '_, S, &T, F> {
-    pub fn job<R: FnMut(&T) -> RunResult + Send + Sync + 'a>(mut self, mut run: R) {
+    pub fn job<R: FnMut(&T) -> anyhow::Result<()> + Send + Sync + 'a>(mut self, mut run: R) {
         self.resolve(Dependency::Read, Order::Strict);
         let Self(worker, _, map, dependencies, _) = self;
         let job = unsafe { Job::new(move |state| run(map(state)), dependencies) };

@@ -10,7 +10,7 @@ pub enum Error {
     UnknownConflict(Scope),
     ReadWriteConflict(Key, Scope, Order),
     WriteWriteConflict(Key, Scope, Order),
-    Dynamic(Box<dyn error::Error + Send + Sync>),
+    Dynamic(anyhow::Error),
     All(Vec<Error>),
 }
 

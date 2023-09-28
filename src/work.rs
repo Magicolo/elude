@@ -320,7 +320,9 @@ fn resolve<S>(
     conflict: &mut Conflict,
     clusters: &mut Vec<Cluster>,
 ) {
-    let Some((left, lefts)) = lefts.split_last_mut() else { return; };
+    let Some((left, lefts)) = lefts.split_last_mut() else {
+        return;
+    };
     let left = (lefts.len(), left);
     if right.1.strong.transitive.contains(&left.0) {
         // 'left' and 'right' already have a transitive strong dependency.

@@ -9,10 +9,10 @@ use elude::{
     work::Worker,
 };
 use parking_lot::Mutex;
-use std::{borrow::Cow, error::Error};
+use std::borrow::Cow;
 
 #[test]
-fn dependencies_is_empty() -> Result<(), Box<dyn Error>> {
+fn dependencies_is_empty() -> anyhow::Result<()> {
     let mut worker = Worker::new((), None)?;
     worker.push(Job::ok());
     let graph = worker.update()?;
@@ -25,7 +25,7 @@ fn dependencies_is_empty() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn barrier_forces_sequential() -> Result<(), Box<dyn Error>> {
+fn barrier_forces_sequential() -> anyhow::Result<()> {
     let mut worker = Worker::new((), None)?;
     worker.extend([Job::ok(), Job::barrier(), Job::ok()]);
     let graph = worker.update()?;
@@ -42,7 +42,7 @@ fn barrier_forces_sequential() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn any_read_read_run_in_parallel() -> Result<(), Box<dyn Error>> {
+fn any_read_read_run_in_parallel() -> anyhow::Result<()> {
     let mut worker = Worker::new((), None)?;
     worker.extend([
         Job::ok().depend([Read(Identifier(0), Relax)]),
@@ -65,7 +65,7 @@ fn any_read_read_run_in_parallel() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn relax_read_write_creates_cluster() -> Result<(), Box<dyn Error>> {
+fn relax_read_write_creates_cluster() -> anyhow::Result<()> {
     let mut worker = Worker::new((), None)?;
     worker.extend([
         Job::ok().depend([Read(Identifier(0), Relax)]),
@@ -116,7 +116,7 @@ fn job<'a, S>(run: impl FnMut() + Send + Sync + Clone + 'a) -> impl Generate<Ite
     })
 }
 #[test]
-fn fett() -> Result<(), Box<dyn Error>> {
+fn fett() -> anyhow::Result<()> {
     dependency()
         .collect::<Vec<_>>()
         .collect::<Vec<_>>()
@@ -134,7 +134,7 @@ fn fett() -> Result<(), Box<dyn Error>> {
                 );
             }
             worker.run()?;
-            Ok::<_, Box<dyn Error>>(())
+            Ok::<_, anyhow::Error>(())
         })?;
     Ok(())
 }

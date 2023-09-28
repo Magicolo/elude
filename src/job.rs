@@ -1,9 +1,6 @@
 use crate::depend::Dependency;
-use std::error;
 
-pub(crate) type Run<'a, S> = Box<dyn FnMut(&mut S) -> RunResult + Send + Sync + 'a>;
-pub(crate) type RunError = Box<dyn error::Error + Send + Sync>;
-pub(crate) type RunResult = Result<(), RunError>;
+pub(crate) type Run<'a, S> = Box<dyn FnMut(&mut S) -> anyhow::Result<()> + Send + Sync + 'a>;
 
 pub struct Job<'a, S> {
     pub(crate) run: Run<'a, S>,
@@ -15,7 +12,7 @@ impl<'a, S> Job<'a, S> {
     /// This library heavily relies on the fact the `dependencies` are exhaustively declared for the `run` closure.
     /// Any omitted dependency may lead to undefined behavior.
     pub unsafe fn new<
-        R: FnMut(&mut S) -> RunResult + Send + Sync + 'a,
+        R: FnMut(&mut S) -> anyhow::Result<()> + Send + Sync + 'a,
         D: IntoIterator<Item = Dependency>,
     >(
         run: R,
@@ -27,7 +24,7 @@ impl<'a, S> Job<'a, S> {
         }
     }
 
-    pub fn with<R: FnMut() -> RunResult + Send + Sync + 'a>(mut run: R) -> Self {
+    pub fn with<R: FnMut() -> anyhow::Result<()> + Send + Sync + 'a>(mut run: R) -> Self {
         unsafe { Self::new(move |_| run(), []) }
     }
 
