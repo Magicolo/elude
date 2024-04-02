@@ -91,10 +91,12 @@ fn path() -> impl Generate<Item = Key> {
     letter().collect().map(Cow::Owned).map(Path)
 }
 fn key() -> impl Generate<Item = Key> {
-    (path(), address(), identifier()).any().map(Unify::unify)
+    (path(), address(), identifier())
+        .any()
+        .map(|key| key.into())
 }
 fn order() -> impl Generate<Item = Order> {
-    (Same(Strict), Same(Relax)).any().map(Unify::unify)
+    (Same(Strict), Same(Relax)).any().map(|order| order.into())
 }
 fn read() -> impl Generate<Item = Dependency> {
     (path(), order()).map(|(key, order)| Read(key, order))
@@ -103,7 +105,7 @@ fn write() -> impl Generate<Item = Dependency> {
     (path(), order()).map(|(key, order)| Write(key, order))
 }
 fn dependency() -> impl Generate<Item = Dependency> {
-    (read(), write()).any().map(Unify::unify)
+    (read(), write()).any().map(|dependency| dependency.into())
 }
 fn job<'a, S>(run: impl FnMut() + Send + Sync + Clone + 'a) -> impl Generate<Item = Job<'a, S>> {
     dependency().collect::<Vec<_>>().map(move |dependencies| {
