@@ -1,7 +1,7 @@
 # Task 01: Benchmark Foundation And Workload Redesign
 
 Last updated: 2026-04-04
-Status: not started
+Status: completed
 Priority: high
 
 ## Goal
@@ -34,6 +34,39 @@ The current harness in `benches/experiment.rs`:
 - mixes scheduler overhead with `Instant::now()` polling and atomic state updates
 - has no abstraction for non-local schedulers
 - does not explicitly benchmark the cases where the three designs should diverge
+
+## Implemented Architecture
+
+Task `01` was completed directly in `benches/experiment.rs` without splitting into support modules. That was a deliberate tradeoff to keep the benchmark target easy to compile and easy to grep while the external adapter set is still small.
+
+The current harness now provides:
+
+- a benchmark IR:
+  - `WorkProfile`
+  - `JobSpec`
+  - `Workload`
+- a scheduler adapter trait:
+  - `BenchAdapter`
+- a generic local adapter:
+  - `ExperimentAdapter<T>` for any `experiment::Scheduler<BenchState>`
+- a lightweight benchmark state:
+  - `BenchState { slots: Box<[AtomicU64]> }`
+
+Important design choices:
+
+- the workload IR now carries:
+  - declared dependencies
+  - optional explicit predecessor hints
+  - a compile-time weight hint derived from the work profile
+- the local experiments currently ignore explicit predecessor hints, but the IR keeps them for future external-library adapters
+- the runtime job body now uses deterministic loop counts rather than `Instant::now()` polling
+- the standard `0ms` suite uses `iterations = 0` and a per-job slot update, which is materially lighter than the previous spin-until-deadline approach
+- each benchmark suite is separated by intent:
+  - `experiment/compile/<scheduler>`
+  - `experiment/run_overhead/<scheduler>`
+  - `experiment/run_parallelism/<scheduler>`
+
+No Cargo dependency changes were needed for this task.
 
 ## Scope
 
@@ -138,6 +171,13 @@ If necessary, keep both:
 - `zero_work_minimal`
 - `zero_work_with_shared_state`
 
+What was actually implemented:
+
+- one standard `0ms` family using minimal per-job slot updates
+- no dedicated shared-state `0ms` variant yet
+
+That was an intentional simplification because the immediate problem was removing artificial timing overhead from the old harness, not adding a second state-contention benchmark family.
+
 ## External Library Compatibility Requirements
 
 The workload IR must support adapters for libraries that:
@@ -154,6 +194,44 @@ Do not hard-code the harness around the current local scheduler API only.
 - `benches/experiment.rs`
 - new files under `benches/` for shared support, if helpful
 - possibly small shared benchmark-facing types in `src/experiment` only if that clearly reduces duplication
+
+## Implemented Workload Catalog
+
+The current harness now includes these workload families.
+
+Compile suite:
+
+- `wide_independent`
+- `hot_key_write_contention`
+- `layer_barrier_stress`
+- `fan_out_fan_in`
+- `mixed_hotspots`
+- `compile_heavy_sparse_keys`
+
+Run-overhead suite:
+
+- `wide_independent`
+- `read_heavy_shared_key`
+- `strict_chain`
+- `hot_key_write_contention`
+
+Run-parallelism suite:
+
+- `wide_independent`
+- `read_heavy_shared_key`
+- `strict_chain`
+- `hot_key_write_contention`
+- `layer_barrier_stress`
+- `straggler_partial_overlap`
+- `fan_out_fan_in`
+- `mixed_hotspots`
+
+Important shapes:
+
+- `layer_barrier_stress` is implemented as `[A lanes][B lanes]` with strict same-key pairs, so `02` must wait on the whole first layer while `01` and `03` can unlock followers lane-by-lane
+- `straggler_partial_overlap` is the same pattern but with one extreme straggler lane in the first wave
+- `fan_out_fan_in` is root write, many shared reads, then sink write on the same key
+- `compile_heavy_sparse_keys` uses many multi-key jobs with sparse shared buckets to stress schedule-time logic without relying on runtime work
 
 ## Concrete Execution Plan
 
@@ -175,6 +253,31 @@ Do not hard-code the harness around the current local scheduler API only.
 - The new workload set includes cases that should favor each scheduler differently.
 - The task file is updated with any deviations from this plan.
 
+## Verification Performed
+
+Commands run during this task:
+
+- `cargo bench --bench experiment --no-run`
+- `cargo bench --bench experiment -- experiment/run_overhead/experiment_01/wide_independent/jobs512_zero`
+- `cargo bench --bench experiment -- experiment/run_parallelism/experiment_02/layer_barrier_stress`
+
+Observed outcomes:
+
+- the refactored benchmark target compiles successfully
+- a filtered overhead benchmark runs successfully under the new naming scheme
+- a filtered parallelism-sensitive benchmark runs successfully under the new naming scheme
+
+Selected observed timings from the filtered verification runs:
+
+- `experiment/run_overhead/experiment_01/wide_independent/jobs512_zero`
+  - about `225-230 µs`
+- `experiment/run_parallelism/experiment_02/layer_barrier_stress/lanes128_fast400_slow5000_follow2000`
+  - about `1.08-1.89 ms`
+
+These numbers are only smoke-test results, not the final benchmark analysis.
+
 ## Progress Log
 
 - 2026-04-04: Task created. No benchmark refactor yet.
+- 2026-04-04: Replaced the old single-workload harness with a workload IR, local adapter layer, separated compile/overhead/parallelism suites, and a standard `0ms` benchmark family.
+- 2026-04-04: Verified the new bench target with `cargo bench --bench experiment --no-run` and filtered Criterion runs.

@@ -3,6 +3,7 @@ use criterion::{
 };
 use elude::{
     depend::{
+        Dependency,
         Dependency::{Read, Write},
         Key::Identifier,
         Order::{Relax, Strict},
@@ -16,336 +17,543 @@ use std::{
     num::NonZeroUsize,
     sync::atomic::{AtomicU64, Ordering::Relaxed as AtomicRelaxed},
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ConflictFlag {
-    ReadRead,
-    ReadWrite,
-    WriteWrite,
-    Relax,
-    Strict,
+#[derive(Clone, Copy, Debug)]
+struct WorkProfile {
+    iterations: u32,
 }
 
-#[derive(Clone, Copy)]
+impl WorkProfile {
+    const ZERO: Self = Self { iterations: 0 };
+
+    const fn busy(iterations: u32) -> Self {
+        Self { iterations }
+    }
+
+    const fn iterations(self) -> u32 {
+        self.iterations
+    }
+
+    fn label(self) -> String {
+        match self.iterations {
+            0 => "zero".to_string(),
+            iterations => format!("iter{iterations}"),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct JobSpec {
+    dependencies: Box<[Dependency]>,
+    predecessors: Box<[usize]>,
+    work: WorkProfile,
+    weight_hint: u32,
+}
+
+impl JobSpec {
+    fn new(
+        work: WorkProfile,
+        dependencies: impl IntoIterator<Item = Dependency>,
+    ) -> Self {
+        Self {
+            dependencies: dependencies.into_iter().collect::<Vec<_>>().into_boxed_slice(),
+            predecessors: Vec::new().into_boxed_slice(),
+            weight_hint: work.iterations(),
+            work,
+        }
+    }
+
+    fn with_predecessors(mut self, predecessors: impl IntoIterator<Item = usize>) -> Self {
+        self.predecessors = predecessors
+            .into_iter()
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        self
+    }
+}
+
+#[derive(Clone, Debug)]
 struct Workload {
-    name: &'static str,
-    jobs: usize,
-    conflicts: &'static [ConflictFlag],
-    job_execution_time_ms: u64,
+    family: &'static str,
+    name: String,
+    jobs: Box<[JobSpec]>,
+    state_slots: usize,
 }
 
-const NONE: &[ConflictFlag] = &[];
-const READ_READ_RELAX: &[ConflictFlag] = &[ConflictFlag::ReadRead, ConflictFlag::Relax];
-const READ_WRITE_RELAX: &[ConflictFlag] = &[ConflictFlag::ReadWrite, ConflictFlag::Relax];
-const READ_WRITE_STRICT: &[ConflictFlag] = &[ConflictFlag::ReadWrite, ConflictFlag::Strict];
-const WRITE_WRITE_RELAX: &[ConflictFlag] = &[ConflictFlag::WriteWrite, ConflictFlag::Relax];
-const WRITE_WRITE_STRICT: &[ConflictFlag] = &[ConflictFlag::WriteWrite, ConflictFlag::Strict];
-const MIXED_RELAX: &[ConflictFlag] = &[
-    ConflictFlag::ReadRead,
-    ConflictFlag::ReadWrite,
-    ConflictFlag::WriteWrite,
-    ConflictFlag::Relax,
-];
-const MIXED_STRICT: &[ConflictFlag] = &[
-    ConflictFlag::ReadRead,
-    ConflictFlag::ReadWrite,
-    ConflictFlag::WriteWrite,
-    ConflictFlag::Strict,
-];
-const MIXED_HYBRID: &[ConflictFlag] = &[
-    ConflictFlag::ReadRead,
-    ConflictFlag::ReadWrite,
-    ConflictFlag::WriteWrite,
-    ConflictFlag::Relax,
-    ConflictFlag::Strict,
-];
+impl Workload {
+    fn new(family: &'static str, name: String, jobs: Vec<JobSpec>) -> Self {
+        let state_slots = jobs.len().max(1);
+        Self {
+            family,
+            name,
+            jobs: jobs.into_boxed_slice(),
+            state_slots,
+        }
+    }
 
-// Representative sample rather than a full cross-product. The matrix keeps the
-// benchmark suite broad enough to compare implementations while keeping a full
-// `cargo bench --bench experiment` run comfortably iterative.
-const RUN_WORKLOADS: &[Workload] = &[
-    Workload {
-        name: "jobs10_none_ms8",
-        jobs: 10,
-        conflicts: NONE,
-        job_execution_time_ms: 8,
-    },
-    Workload {
-        name: "jobs10_write_write_strict_ms9",
-        jobs: 10,
-        conflicts: WRITE_WRITE_STRICT,
-        job_execution_time_ms: 9,
-    },
-    Workload {
-        name: "jobs10_mixed_hybrid_ms10",
-        jobs: 10,
-        conflicts: MIXED_HYBRID,
-        job_execution_time_ms: 10,
-    },
-    Workload {
-        name: "jobs100_read_read_relax_ms4",
-        jobs: 100,
-        conflicts: READ_READ_RELAX,
-        job_execution_time_ms: 4,
-    },
-    Workload {
-        name: "jobs100_read_write_strict_ms5",
-        jobs: 100,
-        conflicts: READ_WRITE_STRICT,
-        job_execution_time_ms: 5,
-    },
-    Workload {
-        name: "jobs100_write_write_relax_ms6",
-        jobs: 100,
-        conflicts: WRITE_WRITE_RELAX,
-        job_execution_time_ms: 6,
-    },
-    Workload {
-        name: "jobs100_mixed_relax_ms7",
-        jobs: 100,
-        conflicts: MIXED_RELAX,
-        job_execution_time_ms: 7,
-    },
-    Workload {
-        name: "jobs1000_none_ms1",
-        jobs: 1000,
-        conflicts: NONE,
-        job_execution_time_ms: 1,
-    },
-    Workload {
-        name: "jobs1000_read_write_relax_ms2",
-        jobs: 1000,
-        conflicts: READ_WRITE_RELAX,
-        job_execution_time_ms: 2,
-    },
-    Workload {
-        name: "jobs1000_mixed_strict_ms3",
-        jobs: 1000,
-        conflicts: MIXED_STRICT,
-        job_execution_time_ms: 3,
-    },
-];
-
-const COMPILE_WORKLOADS: &[Workload] = &[
-    Workload {
-        name: "compile_jobs10_none",
-        jobs: 10,
-        conflicts: NONE,
-        job_execution_time_ms: 1,
-    },
-    Workload {
-        name: "compile_jobs10_read_write_relax",
-        jobs: 10,
-        conflicts: READ_WRITE_RELAX,
-        job_execution_time_ms: 1,
-    },
-    Workload {
-        name: "compile_jobs10_write_write_strict",
-        jobs: 10,
-        conflicts: WRITE_WRITE_STRICT,
-        job_execution_time_ms: 1,
-    },
-    Workload {
-        name: "compile_jobs100_mixed_hybrid",
-        jobs: 100,
-        conflicts: MIXED_HYBRID,
-        job_execution_time_ms: 1,
-    },
-    Workload {
-        name: "compile_jobs1000_read_read_relax",
-        jobs: 1000,
-        conflicts: READ_READ_RELAX,
-        job_execution_time_ms: 1,
-    },
-    Workload {
-        name: "compile_jobs1000_mixed_strict",
-        jobs: 1000,
-        conflicts: MIXED_STRICT,
-        job_execution_time_ms: 1,
-    },
-];
+    fn job_count(&self) -> usize {
+        self.jobs.len()
+    }
+}
 
 struct BenchState {
-    counters: Box<[AtomicU64]>,
-    checksum: AtomicU64,
+    slots: Box<[AtomicU64]>,
 }
 
 impl BenchState {
-    fn new(slots: usize) -> Self {
+    fn new(workload: &Workload) -> Self {
         Self {
-            counters: (0..slots.max(1))
+            slots: (0..workload.state_slots.max(1))
                 .map(|_| AtomicU64::new(0))
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
-            checksum: AtomicU64::new(0),
         }
+    }
+
+    fn record(&self, job_index: usize, value: u64) {
+        self.slots[job_index % self.slots.len()].fetch_add(value | 1, AtomicRelaxed);
+    }
+
+    fn sample(&self) -> u64 {
+        let first = self.slots[0].load(AtomicRelaxed);
+        let last = self.slots[self.slots.len() - 1].load(AtomicRelaxed);
+        first ^ last.rotate_left(11)
     }
 }
 
-fn make_job(workload: Workload, index: usize) -> Job<BenchState> {
-    let duration = Duration::from_millis(workload.job_execution_time_ms);
-    let job = Job::new(move |state: &BenchState| {
-        let mut value = (index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0xa5a5_a5a5_a5a5_a5a5;
-        let deadline = Instant::now() + duration;
-        while Instant::now() < deadline {
-            value = value.rotate_left(7).wrapping_mul(0x94d0_49bb_1331_11eb);
-            std::hint::spin_loop();
-        }
+fn execute_work(work: WorkProfile, state: &BenchState, job_index: usize) {
+    let mut value =
+        (job_index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0xa5a5_a5a5_a5a5_a5a5;
 
-        let slot = index % state.counters.len();
-        state.counters[slot].fetch_add(value, AtomicRelaxed);
-        state.checksum.fetch_add(value ^ slot as u64, AtomicRelaxed);
+    for step in 0..work.iterations() {
+        value = value
+            .rotate_left(7)
+            .wrapping_mul(0x94d0_49bb_1331_11eb)
+            .wrapping_add(step as u64);
+        std::hint::spin_loop();
+    }
+
+    state.record(job_index, value);
+}
+
+trait BenchAdapter {
+    const NAME: &'static str;
+
+    type State;
+    type Compiled;
+
+    fn compile(
+        workload: &Workload,
+        parallelism: Option<NonZeroUsize>,
+    ) -> anyhow::Result<Self::Compiled>;
+
+    fn make_state(workload: &Workload) -> Self::State;
+
+    fn run(compiled: &mut Self::Compiled, state: &Self::State) -> anyhow::Result<()>;
+
+    fn sample(state: &Self::State) -> u64;
+}
+
+struct ExperimentAdapter<T>(std::marker::PhantomData<T>);
+
+impl<T> BenchAdapter for ExperimentAdapter<T>
+where
+    T: elude::experiment::Scheduler<BenchState>,
+{
+    const NAME: &'static str = T::NAME;
+
+    type State = BenchState;
+    type Compiled = T::Schedule;
+
+    fn compile(
+        workload: &Workload,
+        parallelism: Option<NonZeroUsize>,
+    ) -> anyhow::Result<Self::Compiled> {
+        workload
+            .jobs
+            .iter()
+            .enumerate()
+            .fold(T::with_parallelism(parallelism), |scheduler, (index, spec)| {
+                scheduler.add(make_experiment_job(index, spec))
+            })
+            .schedule()
+    }
+
+    fn make_state(workload: &Workload) -> Self::State {
+        BenchState::new(workload)
+    }
+
+    fn run(compiled: &mut Self::Compiled, state: &Self::State) -> anyhow::Result<()> {
+        compiled.run(state)
+    }
+
+    fn sample(state: &Self::State) -> u64 {
+        state.sample()
+    }
+}
+
+fn make_experiment_job(index: usize, spec: &JobSpec) -> Job<BenchState> {
+    let _ = &spec.predecessors;
+    debug_assert_eq!(spec.weight_hint, spec.work.iterations());
+    let work = spec.work;
+
+    Job::new(move |state: &BenchState| {
+        execute_work(work, state, index);
         Ok(())
-    });
-
-    apply_conflicts(job, workload, index)
+    })
+    .depend(spec.dependencies.iter().cloned())
 }
 
-fn apply_conflicts(mut job: Job<BenchState>, workload: Workload, index: usize) -> Job<BenchState> {
-    let stripes = stripe_count(workload.jobs);
-    let relax = has_flag(workload.conflicts, ConflictFlag::Relax);
-    let strict = has_flag(workload.conflicts, ConflictFlag::Strict);
+fn write_key(key: usize, strict: bool) -> Dependency {
+    Write(Identifier(key), if strict { Strict } else { Relax })
+}
 
-    if has_flag(workload.conflicts, ConflictFlag::ReadRead) {
-        let key = Identifier(index % stripes);
-        job = job.depend([Read(key, select_order(relax, strict, AccessFamily::ReadRead, index))]);
-    }
+fn read_key(key: usize, strict: bool) -> Dependency {
+    Read(Identifier(key), if strict { Strict } else { Relax })
+}
 
-    if has_flag(workload.conflicts, ConflictFlag::ReadWrite) {
-        let key = Identifier(stripes + index % stripes);
-        let order = select_order(relax, strict, AccessFamily::ReadWrite, index);
-        job = if index % 2 == 0 {
-            job.depend([Read(key, order)])
+fn wide_independent(job_count: usize, work: WorkProfile) -> Workload {
+    Workload::new(
+        "wide_independent",
+        format!("jobs{job_count}_{}", work.label()),
+        (0..job_count).map(|_| JobSpec::new(work, [])).collect(),
+    )
+}
+
+fn strict_chain(job_count: usize, work: WorkProfile) -> Workload {
+    Workload::new(
+        "strict_chain",
+        format!("jobs{job_count}_{}", work.label()),
+        (0..job_count)
+            .map(|index| {
+                let predecessors = index.checked_sub(1).into_iter().collect::<Vec<_>>();
+                JobSpec::new(work, [write_key(0, true)]).with_predecessors(predecessors)
+            })
+            .collect(),
+    )
+}
+
+fn hot_key_write_contention(job_count: usize, work: WorkProfile) -> Workload {
+    Workload::new(
+        "hot_key_write_contention",
+        format!("jobs{job_count}_{}", work.label()),
+        (0..job_count)
+            .map(|index| {
+                let predecessors = index.checked_sub(1).into_iter().collect::<Vec<_>>();
+                JobSpec::new(work, [write_key(0, false)]).with_predecessors(predecessors)
+            })
+            .collect(),
+    )
+}
+
+fn read_heavy_shared_key(job_count: usize, work: WorkProfile) -> Workload {
+    Workload::new(
+        "read_heavy_shared_key",
+        format!("jobs{job_count}_{}", work.label()),
+        (0..job_count)
+            .map(|index| JobSpec::new(work, [read_key(0, index % 2 != 0)]))
+            .collect(),
+    )
+}
+
+fn layer_barrier_stress(
+    lanes: usize,
+    fast_iterations: u32,
+    slow_iterations: u32,
+    follower_iterations: u32,
+) -> Workload {
+    let mut jobs = Vec::with_capacity(lanes * 2);
+
+    for lane in 0..lanes {
+        let work = if lane % 2 == 0 {
+            WorkProfile::busy(fast_iterations)
         } else {
-            job.depend([Write(key, order)])
+            WorkProfile::busy(slow_iterations)
         };
+        jobs.push(JobSpec::new(work, [write_key(lane, true)]));
     }
 
-    if has_flag(workload.conflicts, ConflictFlag::WriteWrite) {
-        let key = Identifier((2 * stripes) + index % stripes);
-        let order = select_order(relax, strict, AccessFamily::WriteWrite, index);
-        job = job.depend([Write(key, order)]);
+    for lane in 0..lanes {
+        jobs.push(
+            JobSpec::new(WorkProfile::busy(follower_iterations), [write_key(lane, true)])
+                .with_predecessors([lane]),
+        );
     }
 
-    job
+    Workload::new(
+        "layer_barrier_stress",
+        format!(
+            "lanes{lanes}_fast{fast_iterations}_slow{slow_iterations}_follow{follower_iterations}"
+        ),
+        jobs,
+    )
 }
 
-#[derive(Clone, Copy)]
-enum AccessFamily {
-    ReadRead,
-    ReadWrite,
-    WriteWrite,
+fn straggler_partial_overlap(
+    lanes: usize,
+    fast_iterations: u32,
+    straggler_iterations: u32,
+    follower_iterations: u32,
+) -> Workload {
+    let mut jobs = Vec::with_capacity(lanes * 2);
+
+    for lane in 0..lanes {
+        let work = if lane == 0 {
+            WorkProfile::busy(straggler_iterations)
+        } else {
+            WorkProfile::busy(fast_iterations)
+        };
+        jobs.push(JobSpec::new(work, [write_key(lane, true)]));
+    }
+
+    for lane in 0..lanes {
+        jobs.push(
+            JobSpec::new(WorkProfile::busy(follower_iterations), [write_key(lane, true)])
+                .with_predecessors([lane]),
+        );
+    }
+
+    Workload::new(
+        "straggler_partial_overlap",
+        format!(
+            "lanes{lanes}_fast{fast_iterations}_straggler{straggler_iterations}_follow{follower_iterations}"
+        ),
+        jobs,
+    )
 }
 
-fn select_order(relax: bool, strict: bool, family: AccessFamily, index: usize) -> elude::depend::Order {
-    match (relax, strict) {
-        (true, false) => Relax,
-        (false, true) => Strict,
-        (true, true) => match family {
-            AccessFamily::ReadWrite => Relax,
-            AccessFamily::WriteWrite => Strict,
-            AccessFamily::ReadRead => {
-                if index % 2 == 0 {
-                    Relax
+fn fan_out_fan_in(
+    fan_out: usize,
+    root_iterations: u32,
+    leaf_iterations: u32,
+    sink_iterations: u32,
+) -> Workload {
+    let mut jobs = Vec::with_capacity(fan_out + 2);
+
+    jobs.push(JobSpec::new(
+        WorkProfile::busy(root_iterations),
+        [write_key(0, true)],
+    ));
+
+    for _ in 0..fan_out {
+        jobs.push(
+            JobSpec::new(WorkProfile::busy(leaf_iterations), [read_key(0, true)])
+                .with_predecessors([0]),
+        );
+    }
+
+    jobs.push(
+        JobSpec::new(WorkProfile::busy(sink_iterations), [write_key(0, true)])
+            .with_predecessors(1..=fan_out),
+    );
+
+    Workload::new(
+        "fan_out_fan_in",
+        format!("fanout{fan_out}_root{root_iterations}_leaf{leaf_iterations}_sink{sink_iterations}"),
+        jobs,
+    )
+}
+
+fn mixed_hotspots(blocks: usize) -> Workload {
+    let mut jobs = Vec::with_capacity(blocks * 6);
+    let lane_base = 10_000usize;
+
+    for block in 0..blocks {
+        let lane = lane_base + block;
+        let hot = 1 + (block % 4);
+
+        jobs.push(JobSpec::new(WorkProfile::busy(400), [read_key(0, false)]));
+        jobs.push(JobSpec::new(WorkProfile::busy(1_100), [write_key(0, false)]));
+        jobs.push(JobSpec::new(WorkProfile::busy(2_200), [write_key(hot, true)]));
+        jobs.push(JobSpec::new(WorkProfile::busy(500), [read_key(hot, false)]));
+        jobs.push(JobSpec::new(WorkProfile::busy(900), [write_key(lane, false)]));
+        jobs.push(JobSpec::new(
+            WorkProfile::busy(700),
+            [read_key(lane, false), write_key(100 + (block % 3), true)],
+        ));
+    }
+
+    Workload::new("mixed_hotspots", format!("blocks{blocks}"), jobs)
+}
+
+fn compile_heavy_sparse_keys(job_count: usize) -> Workload {
+    let mut jobs = Vec::with_capacity(job_count);
+    let unique_base = job_count * 10;
+
+    for index in 0..job_count {
+        let bucket_a = 50_000 + (index % 97);
+        let bucket_b = 60_000 + ((index * 11 + 7) % 193);
+        let bucket_c = 70_000 + ((index * 17 + 13) % 53);
+
+        jobs.push(JobSpec::new(
+            WorkProfile::ZERO,
+            [
+                read_key(unique_base + (index * 2), index % 5 == 0),
+                read_key(unique_base + (index * 2) + 1, false),
+                write_key(bucket_a, index % 7 == 0),
+                if index % 3 == 0 {
+                    write_key(bucket_b, false)
                 } else {
-                    Strict
-                }
-            }
-        },
-        (false, false) => Relax,
+                    read_key(bucket_c, index % 11 == 0)
+                },
+            ],
+        ));
     }
+
+    Workload::new(
+        "compile_heavy_sparse_keys",
+        format!("jobs{job_count}_multi_key_sparse_zero"),
+        jobs,
+    )
 }
 
-fn has_flag(flags: &[ConflictFlag], needle: ConflictFlag) -> bool {
-    flags.iter().any(|flag| *flag == needle)
+fn compile_workloads() -> Vec<Workload> {
+    vec![
+        wide_independent(1_024, WorkProfile::ZERO),
+        hot_key_write_contention(768, WorkProfile::ZERO),
+        layer_barrier_stress(256, 0, 0, 0),
+        fan_out_fan_in(511, 0, 0, 0),
+        mixed_hotspots(96),
+        compile_heavy_sparse_keys(1_536),
+    ]
 }
 
-fn stripe_count(jobs: usize) -> usize {
-    match jobs {
-        0..=16 => 1,
-        17..=128 => 4,
-        _ => 16,
-    }
+fn overhead_workloads() -> Vec<Workload> {
+    vec![
+        wide_independent(512, WorkProfile::ZERO),
+        read_heavy_shared_key(512, WorkProfile::ZERO),
+        strict_chain(256, WorkProfile::ZERO),
+        hot_key_write_contention(256, WorkProfile::ZERO),
+    ]
+}
+
+fn parallelism_workloads() -> Vec<Workload> {
+    vec![
+        wide_independent(512, WorkProfile::busy(4_000)),
+        read_heavy_shared_key(512, WorkProfile::busy(4_000)),
+        strict_chain(256, WorkProfile::busy(2_000)),
+        hot_key_write_contention(256, WorkProfile::busy(2_000)),
+        layer_barrier_stress(128, 400, 5_000, 2_000),
+        straggler_partial_overlap(128, 400, 25_000, 1_800),
+        fan_out_fan_in(255, 6_000, 1_000, 6_000),
+        mixed_hotspots(48),
+    ]
 }
 
 fn benchmark_parallelism() -> Option<NonZeroUsize> {
     thread::available_parallelism().ok()
 }
 
-fn build_scheduler<T>(workload: Workload) -> T
-where
-    T: elude::experiment::Scheduler<BenchState>,
-{
-    (0..workload.jobs).fold(
-        T::with_parallelism(benchmark_parallelism()),
-        |scheduler, index| scheduler.add(make_job(workload, index)),
-    )
-}
-
-fn configure_compile_group(group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>) {
+fn configure_compile_group(
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+) {
     group.sample_size(10);
     group.sampling_mode(SamplingMode::Flat);
     group.measurement_time(Duration::from_secs(1));
     group.warm_up_time(Duration::from_millis(200));
 }
 
-fn configure_run_group(group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>) {
+fn configure_overhead_group(
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+) {
     group.sample_size(10);
     group.sampling_mode(SamplingMode::Flat);
     group.measurement_time(Duration::from_secs(2));
     group.warm_up_time(Duration::from_millis(250));
 }
 
-fn bench_compile<T>(c: &mut Criterion, workloads: &[Workload])
+fn configure_parallelism_group(
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+) {
+    group.sample_size(10);
+    group.sampling_mode(SamplingMode::Flat);
+    group.measurement_time(Duration::from_secs(3));
+    group.warm_up_time(Duration::from_millis(300));
+}
+
+fn bench_compile<A>(c: &mut Criterion, workloads: &[Workload])
 where
-    T: elude::experiment::Scheduler<BenchState>,
+    A: BenchAdapter,
 {
-    let mut group = c.benchmark_group(format!("experiment/compile/{}", T::NAME));
+    let mut group = c.benchmark_group(format!("experiment/compile/{}", A::NAME));
     configure_compile_group(&mut group);
-    for workload in workloads.iter().copied() {
-        group.throughput(Throughput::Elements(workload.jobs as u64));
-        group.bench_with_input(BenchmarkId::from_parameter(workload.name), &workload, |b, workload| {
-            b.iter(|| black_box(build_scheduler::<T>(*workload).schedule().unwrap()))
-        });
+
+    for workload in workloads.iter() {
+        group.throughput(Throughput::Elements(workload.job_count() as u64));
+        group.bench_with_input(
+            BenchmarkId::new(workload.family, workload.name.as_str()),
+            workload,
+            |b, workload| {
+                b.iter(|| {
+                    black_box(A::compile(workload, benchmark_parallelism()).unwrap())
+                })
+            },
+        );
     }
+
     group.finish();
 }
 
-fn bench_run<T>(c: &mut Criterion, workloads: &[Workload])
-where
-    T: elude::experiment::Scheduler<BenchState>,
+fn bench_run_suite<A>(
+    c: &mut Criterion,
+    suite: &str,
+    workloads: &[Workload],
+    configure: fn(&mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>),
+) where
+    A: BenchAdapter,
 {
-    let mut group = c.benchmark_group(format!("experiment/run/{}", T::NAME));
-    configure_run_group(&mut group);
-    for workload in workloads.iter().copied() {
-        group.throughput(Throughput::Elements(workload.jobs as u64));
-        group.bench_with_input(BenchmarkId::from_parameter(workload.name), &workload, |b, workload| {
-            let mut compiled = build_scheduler::<T>(*workload).schedule().unwrap();
-            let state = BenchState::new(stripe_count(workload.jobs) * 3);
-            b.iter(|| {
-                compiled.run(&state).unwrap();
-                black_box(state.checksum.load(AtomicRelaxed))
-            })
-        });
+    let mut group = c.benchmark_group(format!("experiment/{suite}/{}", A::NAME));
+    configure(&mut group);
+
+    for workload in workloads.iter() {
+        group.throughput(Throughput::Elements(workload.job_count() as u64));
+        group.bench_with_input(
+            BenchmarkId::new(workload.family, workload.name.as_str()),
+            workload,
+            |b, workload| {
+                let mut compiled = A::compile(workload, benchmark_parallelism()).unwrap();
+                let state = A::make_state(workload);
+                b.iter(|| {
+                    A::run(&mut compiled, &state).unwrap();
+                    black_box(A::sample(&state));
+                })
+            },
+        );
     }
+
     group.finish();
+}
+
+fn bench_adapter<A>(c: &mut Criterion)
+where
+    A: BenchAdapter,
+{
+    let compile = compile_workloads();
+    let overhead = overhead_workloads();
+    let parallelism = parallelism_workloads();
+
+    bench_compile::<A>(c, &compile);
+    bench_run_suite::<A>(c, "run_overhead", &overhead, configure_overhead_group);
+    bench_run_suite::<A>(
+        c,
+        "run_parallelism",
+        &parallelism,
+        configure_parallelism_group,
+    );
 }
 
 fn bench_experiment_01(c: &mut Criterion) {
-    bench_compile::<experiment_01::Scheduler<BenchState>>(c, COMPILE_WORKLOADS);
-    bench_run::<experiment_01::Scheduler<BenchState>>(c, RUN_WORKLOADS);
+    bench_adapter::<ExperimentAdapter<experiment_01::Scheduler<BenchState>>>(c);
 }
 
 fn bench_experiment_02(c: &mut Criterion) {
-    bench_compile::<experiment_02::Scheduler<BenchState>>(c, COMPILE_WORKLOADS);
-    bench_run::<experiment_02::Scheduler<BenchState>>(c, RUN_WORKLOADS);
+    bench_adapter::<ExperimentAdapter<experiment_02::Scheduler<BenchState>>>(c);
 }
 
 fn bench_experiment_03(c: &mut Criterion) {
-    bench_compile::<experiment_03::Scheduler<BenchState>>(c, COMPILE_WORKLOADS);
-    bench_run::<experiment_03::Scheduler<BenchState>>(c, RUN_WORKLOADS);
+    bench_adapter::<ExperimentAdapter<experiment_03::Scheduler<BenchState>>>(c);
 }
 
 criterion_group!(

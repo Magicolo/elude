@@ -1,7 +1,7 @@
 # Scheduler Experiment Task Plan
 
 Last updated: 2026-04-04
-Plan status: planning only
+Plan status: tasks `00` and `01` completed, remaining tasks not started
 
 ## Mission
 
@@ -22,7 +22,7 @@ No implementation was performed in this planning pass. This folder is the execut
 
 ## Important Context
 
-- The worktree was already dirty on 2026-04-04. Do not assume a clean repository and do not revert unrelated changes.
+- The repository was rechecked during task `00`; `git status --short` was clean at that time.
 - The shared experiment API lives in `src/experiment/mod.rs`.
 - The current benchmark harness is `benches/experiment.rs`.
 - The current experiments are:
@@ -50,8 +50,8 @@ Tasks `02`, `03`, and `04` can overlap conceptually once task `01` is in place, 
 
 | Task | Status | Depends on | Purpose |
 | --- | --- | --- | --- |
-| `00-current-state.md` | Reference | none | Cold-start summary of the existing repo and likely bottlenecks |
-| `01-benchmark-foundation.md` | Not started | partial input from `05` | Refactor benchmarks into a reusable comparison framework and add new workloads |
+| `00-current-state.md` | Completed | none | Cold-start summary of the existing repo and likely bottlenecks |
+| `01-benchmark-foundation.md` | Completed | partial input from `05` | Refactor benchmarks into a reusable comparison framework and add new workloads |
 | `02-experiment-01.md` | Not started | `01` preferred | Improve the dynamic reservation scheduler while preserving its identity |
 | `03-experiment-02.md` | Not started | `01` preferred | Improve the layered baseline while keeping it a layered scheduler |
 | `04-experiment-03.md` | Not started | `01` preferred | Improve the static DAG scheduler while keeping it a static DAG scheduler |
@@ -86,3 +86,9 @@ The overall project is done when:
 ## First File To Read
 
 If you are starting fresh, read `task/00-current-state.md` next.
+
+## Progress Log
+
+- 2026-04-04: Created the initial task dossier.
+- 2026-04-04: Completed task `00` and verified the repo was clean at that time.
+- 2026-04-04: Completed task `01` with a refactored benchmark IR, local adapter layer, standard `0ms` suite, and new parallelism-oriented workloads.
