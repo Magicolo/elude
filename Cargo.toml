@@ -12,3 +12,8 @@ anyhow = "*"
 
 [dev-dependencies]
 checkito = "*"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "experiment"
+harness = false

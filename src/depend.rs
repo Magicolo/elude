@@ -1,3 +1,4 @@
+use crate::error::Error;
 use std::{
     any::TypeId,
     borrow::Cow,
@@ -5,8 +6,6 @@ use std::{
     collections::{HashMap, HashSet},
     result,
 };
-
-use crate::error::Error;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Scope {
@@ -101,9 +100,12 @@ impl Conflict {
         Error::all(errors).flatten(true).map_or(Ok(()), Err)
     }
 
-    /// - `Ok(Strict)` means that execution is strictly allowed without any concern for the given `dependencies`.
-    /// - `Ok(Relax)` means that execution may proceed as long as the given `dependencies` are not executing (no ordering is imposed).
-    /// - `Err(error)` means that execution can not proceed as long as the given `dependencies` have not completely executed.
+    /// - `Ok(Strict)` means that execution is strictly allowed without any
+    ///   concern for the given `dependencies`.
+    /// - `Ok(Relax)` means that execution may proceed as long as the given
+    ///   `dependencies` are not executing (no ordering is imposed).
+    /// - `Err(error)` means that execution can not proceed as long as the given
+    ///   `dependencies` have not completely executed.
     pub fn detect_outer(&mut self, dependencies: &[Dependency], all: bool) -> Result<Order, Error> {
         let mut allow = Order::Strict;
         let mut errors = Vec::new();
@@ -205,6 +207,7 @@ impl Conflict {
 
 unsafe impl Depend for () {
     type Dependencies = [Dependency; 0];
+
     fn depend(&self) -> [Dependency; 0] {
         []
     }
@@ -212,6 +215,7 @@ unsafe impl Depend for () {
 
 unsafe impl<T: Depend> Depend for &T {
     type Dependencies = T::Dependencies;
+
     fn depend(&self) -> Self::Dependencies {
         T::depend(self)
     }
@@ -219,6 +223,7 @@ unsafe impl<T: Depend> Depend for &T {
 
 unsafe impl<T: Depend> Depend for &mut T {
     type Dependencies = T::Dependencies;
+
     fn depend(&self) -> Self::Dependencies {
         T::depend(self)
     }
