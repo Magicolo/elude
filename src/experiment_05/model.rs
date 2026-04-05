@@ -5,7 +5,7 @@ use crate::{
 };
 use anyhow::Result;
 use parking_lot::Mutex;
-use rayon::{Scope as RayonScope, ThreadPool, ThreadPoolBuilder};
+use rayon::{prelude::*, Scope as RayonScope, ThreadPool, ThreadPoolBuilder};
 use std::{
     cmp::{max, Ordering, Reverse},
     collections::HashMap,
@@ -24,7 +24,6 @@ type LocalIndex = u8;
 type SharedRun<S> = Arc<dyn Fn(&S) -> anyhow::Result<()> + Send + Sync + 'static>;
 
 const MAX_CLUSTER_JOBS: usize = 16;
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Access {
     key: Key,
@@ -118,8 +117,16 @@ struct ClusterJob<S> {
     priority: LocalPriority,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClusterMode {
+    Dynamic,
+    Static,
+    Serial,
+}
+
 #[repr(align(64))]
 struct Cluster<S> {
+    mode: ClusterMode,
     ready_mask_initial: u64,
     ready_mask: AtomicU64,
     done_mask: AtomicU64,
@@ -134,6 +141,7 @@ pub struct Schedule<S: Sync> {
     pool: ThreadPool,
     clusters: Box<[Cluster<S>]>,
     roots: Box<[ClusterId]>,
+    trivial_parallel: bool,
 }
 
 struct RunContext<'schedule, 'state, 'sync, S: Sync> {
@@ -174,6 +182,7 @@ impl<S: Sync> Schedule<S> {
                 pool: ThreadPoolBuilder::new().num_threads(1).build()?,
                 clusters: Vec::new().into_boxed_slice(),
                 roots: Vec::new().into_boxed_slice(),
+                trivial_parallel: true,
             });
         }
 
@@ -234,6 +243,7 @@ impl<S: Sync> Schedule<S> {
             final_heights,
             &stats,
         );
+        let trivial_parallel = is_trivial_parallel_schedule(&clusters, &roots);
 
         let threads = parallelism
             .or_else(|| thread::available_parallelism().ok())
@@ -245,10 +255,20 @@ impl<S: Sync> Schedule<S> {
             pool,
             clusters: clusters.into_boxed_slice(),
             roots: roots.into_boxed_slice(),
+            trivial_parallel,
         })
     }
 
     pub fn run(&mut self, state: &S) -> Result<()> {
+        if self.trivial_parallel {
+            return self.pool.install(|| {
+                self.clusters.par_iter().try_for_each(|cluster| {
+                    let job = &cluster.jobs[0];
+                    (job.run)(state)
+                })
+            });
+        }
+
         self.prepare_run();
 
         let errors = Mutex::new(Vec::new());
@@ -972,7 +992,15 @@ fn build_compiled_clusters<S>(
             roots.push(cluster_id as ClusterId);
         }
 
+        let mode = classify_cluster_mode(
+            cluster_ready_mask,
+            &packed_jobs,
+            &packed_local_successors,
+            &dynamic_conflict_masks[cluster_id],
+        );
+
         clusters.push(Cluster {
+            mode,
             ready_mask_initial: cluster_ready_mask,
             ready_mask: AtomicU64::new(cluster_ready_mask),
             done_mask: AtomicU64::new(0),
@@ -995,6 +1023,45 @@ fn build_compiled_clusters<S>(
 
     let _ = final_successors;
     (clusters, roots)
+}
+
+fn classify_cluster_mode<S>(
+    ready_mask_initial: u64,
+    jobs: &[ClusterJob<S>],
+    local_successors: &[LocalIndex],
+    dynamic_conflict_masks: &[u64],
+) -> ClusterMode {
+    let has_dynamic_conflicts = dynamic_conflict_masks.iter().any(|&mask| mask != 0);
+    if has_dynamic_conflicts {
+        return ClusterMode::Dynamic;
+    }
+
+    let local_roots = jobs
+        .iter()
+        .filter(|job| job.local_predecessor_mask == 0)
+        .count();
+    let is_serial = ready_mask_initial.count_ones() <= 1
+        && local_roots <= 1
+        && jobs.iter().all(|job| {
+            let predecessor_count = job.local_predecessor_mask.count_ones();
+            predecessor_count <= 1 && local_successors_slice(job, local_successors).len() <= 1
+        });
+
+    if is_serial {
+        ClusterMode::Serial
+    } else {
+        ClusterMode::Static
+    }
+}
+
+fn is_trivial_parallel_schedule<S>(clusters: &[Cluster<S>], roots: &[ClusterId]) -> bool {
+    roots.len() == clusters.len()
+        && clusters.iter().all(|cluster| {
+            cluster.jobs.len() == 1
+                && cluster.ready_mask_initial == 1
+                && cluster.local_successors.is_empty()
+                && cluster.remote_successors.is_empty()
+        })
 }
 
 fn try_spawn_cluster<'context, 'schedule, 'state, 'sync, 'scope, S: Sync>(
@@ -1024,7 +1091,7 @@ fn try_spawn_cluster<'context, 'schedule, 'state, 'sync, 'scope, S: Sync>(
 
 fn run_cluster<'context, 'schedule, 'state, 'sync, 'scope, S: Sync>(
     context: &'context RunContext<'schedule, 'state, 'sync, S>,
-    cluster_id: ClusterId,
+    mut cluster_id: ClusterId,
     scope: &RayonScope<'scope>,
 ) where
     'context: 'scope,
@@ -1032,17 +1099,18 @@ fn run_cluster<'context, 'schedule, 'state, 'sync, 'scope, S: Sync>(
     'state: 'scope,
     'sync: 'scope,
 {
-    let cluster = &context.schedule.clusters[cluster_id as usize];
-    let mut ready = cluster.ready_mask.swap(0, AcqRel);
-
     loop {
+        let cluster = &context.schedule.clusters[cluster_id as usize];
+        let mut ready = cluster.ready_mask.swap(0, AcqRel);
+        let mut done_mask = cluster.done_mask.load(Relaxed);
+        let mut next_inline_cluster = None;
+
         while ready != 0 {
             if context.cancelled.load(Acquire) {
                 cluster.queued.store(false, Release);
                 return;
             }
 
-            let done_mask = cluster.done_mask.load(Acquire);
             let local = select_ready_job(context.schedule, cluster_id, ready, done_mask);
             let bit = 1u64 << local;
             ready &= !bit;
@@ -1056,40 +1124,44 @@ fn run_cluster<'context, 'schedule, 'state, 'sync, 'scope, S: Sync>(
                 return;
             }
 
-            let done_after = cluster.done_mask.fetch_or(bit, AcqRel) | bit;
+            done_mask |= bit;
+            cluster.done_mask.store(done_mask, Release);
 
-            for &successor in local_successors(cluster, job).iter() {
-                let successor_job = &cluster.jobs[successor as usize];
-                let successor_bit = 1u64 << successor;
-                if done_after & successor_bit == 0
-                    && successor_job.external_wait.load(Acquire) == 0
-                    && done_after & successor_job.local_predecessor_mask
-                        == successor_job.local_predecessor_mask
-                {
-                    ready |= successor_bit;
+            match cluster.mode {
+                ClusterMode::Serial => {
+                    if let Some(successor) = serial_successor(cluster, job) {
+                        let successor_job = &cluster.jobs[successor as usize];
+                        let successor_bit = 1u64 << successor;
+                        if done_mask & successor_bit == 0
+                            && successor_job.external_wait.load(Acquire) == 0
+                            && done_mask & successor_job.local_predecessor_mask
+                                == successor_job.local_predecessor_mask
+                        {
+                            ready |= successor_bit;
+                        }
+                    }
+                }
+                ClusterMode::Static | ClusterMode::Dynamic => {
+                    for &successor in local_successors(cluster, job).iter() {
+                        let successor_job = &cluster.jobs[successor as usize];
+                        let successor_bit = 1u64 << successor;
+                        if done_mask & successor_bit == 0
+                            && successor_job.external_wait.load(Acquire) == 0
+                            && done_mask & successor_job.local_predecessor_mask
+                                == successor_job.local_predecessor_mask
+                        {
+                            ready |= successor_bit;
+                        }
+                    }
                 }
             }
 
-            for successor in remote_successors(cluster, job).iter().copied() {
-                let target_cluster = &context.schedule.clusters[successor.cluster as usize];
-                let target_job = &target_cluster.jobs[successor.job as usize];
-                if target_job.external_wait.fetch_sub(1, AcqRel) != 1 {
-                    continue;
-                }
-
-                let target_done = target_cluster.done_mask.load(Acquire);
-                let target_bit = 1u64 << successor.job;
-                if target_done & target_bit != 0
-                    || target_done & target_job.local_predecessor_mask
-                        != target_job.local_predecessor_mask
-                {
-                    continue;
-                }
-
-                if target_cluster.ready_mask.fetch_or(target_bit, AcqRel) & target_bit == 0 {
-                    try_spawn_cluster(context, successor.cluster, scope);
-                }
-            }
+            wake_remote_successors(
+                context,
+                remote_successors(cluster, job),
+                &mut next_inline_cluster,
+                scope,
+            );
         }
 
         if context.cancelled.load(Acquire) {
@@ -1105,10 +1177,19 @@ fn run_cluster<'context, 'schedule, 'state, 'sync, 'scope, S: Sync>(
 
         cluster.queued.store(false, Release);
         let remote_ready = cluster.ready_mask.swap(0, AcqRel);
-        if remote_ready != 0 && !cluster.queued.swap(true, AcqRel) {
-            ready = remote_ready;
+        if remote_ready != 0 {
+            if !cluster.queued.swap(true, AcqRel) {
+                ready = remote_ready;
+                continue;
+            }
+            cluster.ready_mask.fetch_or(remote_ready, Release);
+        }
+
+        if let Some(next_cluster) = next_inline_cluster.take() {
+            cluster_id = next_cluster;
             continue;
         }
+
         return;
     }
 }
@@ -1120,6 +1201,13 @@ fn select_ready_job<S: Sync>(
     done_mask: u64,
 ) -> LocalIndex {
     let cluster = &schedule.clusters[cluster_id as usize];
+    if ready_mask & (ready_mask - 1) == 0 {
+        return ready_mask.trailing_zeros() as LocalIndex;
+    }
+    if cluster.mode != ClusterMode::Dynamic {
+        return ready_mask.trailing_zeros() as LocalIndex;
+    }
+
     let mut candidates = ready_mask;
     let mut best = candidates.trailing_zeros() as LocalIndex;
     candidates &= candidates - 1;
@@ -1134,8 +1222,48 @@ fn select_ready_job<S: Sync>(
         }
     }
 
-    let _ = cluster;
     best
+}
+
+fn wake_remote_successors<'context, 'schedule, 'state, 'sync, 'scope, S: Sync>(
+    context: &'context RunContext<'schedule, 'state, 'sync, S>,
+    successors: &[RemoteSuccessor],
+    next_inline_cluster: &mut Option<ClusterId>,
+    scope: &RayonScope<'scope>,
+) where
+    'context: 'scope,
+    'schedule: 'scope,
+    'state: 'scope,
+    'sync: 'scope,
+{
+    for successor in successors.iter().copied() {
+        let target_cluster = &context.schedule.clusters[successor.cluster as usize];
+        let target_job = &target_cluster.jobs[successor.job as usize];
+        if target_job.external_wait.fetch_sub(1, AcqRel) != 1 {
+            continue;
+        }
+
+        let target_done = target_cluster.done_mask.load(Acquire);
+        let target_bit = 1u64 << successor.job;
+        if target_done & target_bit != 0
+            || target_done & target_job.local_predecessor_mask != target_job.local_predecessor_mask
+        {
+            continue;
+        }
+
+        if target_cluster.ready_mask.fetch_or(target_bit, AcqRel) & target_bit != 0 {
+            continue;
+        }
+
+        if target_cluster.queued.swap(true, AcqRel) {
+            continue;
+        }
+
+        match next_inline_cluster {
+            Some(_) => scope.spawn(move |scope| run_cluster(context, successor.cluster, scope)),
+            None => *next_inline_cluster = Some(successor.cluster),
+        }
+    }
 }
 
 fn compare_ready_job<S: Sync>(
@@ -1224,8 +1352,7 @@ fn local_successors<'cluster, S>(
     cluster: &'cluster Cluster<S>,
     job: &ClusterJob<S>,
 ) -> &'cluster [LocalIndex] {
-    &cluster.local_successors
-        [job.local_successor_range.start as usize..job.local_successor_range.end as usize]
+    local_successors_slice(job, &cluster.local_successors)
 }
 
 fn remote_successors<'cluster, S>(
@@ -1234,6 +1361,26 @@ fn remote_successors<'cluster, S>(
 ) -> &'cluster [RemoteSuccessor] {
     &cluster.remote_successors
         [job.remote_successor_range.start as usize..job.remote_successor_range.end as usize]
+}
+
+fn local_successors_slice<'slice, S>(
+    job: &ClusterJob<S>,
+    local_successors: &'slice [LocalIndex],
+) -> &'slice [LocalIndex] {
+    &local_successors
+        [job.local_successor_range.start as usize..job.local_successor_range.end as usize]
+}
+
+fn serial_successor<S>(cluster: &Cluster<S>, job: &ClusterJob<S>) -> Option<LocalIndex> {
+    let successors = local_successors(cluster, job);
+    match successors {
+        [successor] => Some(*successor),
+        [] => None,
+        _ => {
+            debug_assert!(false, "serial cluster had branching local successors");
+            Some(successors[0])
+        }
+    }
 }
 
 #[inline]

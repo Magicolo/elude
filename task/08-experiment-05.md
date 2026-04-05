@@ -729,6 +729,28 @@ The heuristic was then revised:
 
 This second version produced the benchmark results below.
 
+## Optimization Round 2
+
+After the first prototype landed, the next optimization pass focused on the
+remaining generic-runtime waste rather than changing the representation again.
+
+The main changes were:
+
+- compile each cluster into one of three runtime modes:
+  - `Dynamic`
+  - `Static`
+  - `Serial`
+- switch inter-cluster wakeups to a work-first chain, so one newly-ready
+  cluster can continue inline instead of always bouncing through the pool
+- stop using `fetch_or` on `done_mask` in the cluster owner thread and publish a
+  locally-maintained `done_mask` with plain atomic stores
+- add a schedule-level `trivial_parallel` fast path that bypasses the entire
+  cluster runtime when the whole schedule compiles to terminal singleton
+  clusters
+
+The last item is especially important. It means `experiment_05` no longer pays
+cluster machinery at all on the “just run many independent jobs” shape.
+
 ## Grounded Benchmark Results
 
 Commands used:
@@ -746,45 +768,51 @@ Commands used:
 - `cargo bench --bench experiment -- experiment/run_parallelism/experiment_03/mixed_hotspots`
 - `cargo bench --bench experiment -- experiment/compile/experiment_05/compile_heavy_sparse_keys`
 
+All benchmark comparisons below were rerun sequentially during this optimization
+pass. Earlier concurrent Criterion runs were discarded as invalid for
+comparison.
+
 ### Best Signals
 
 - `run_overhead / wide_independent / jobs512_zero`
-  - `experiment_05`: about `425.97 µs .. 454.36 µs`
-  - `experiment_03`: about `414.93 µs .. 454.05 µs`
+  - `experiment_05`: about `31.06 µs .. 31.50 µs`
+  - `experiment_03`: about `264.92 µs .. 269.18 µs`
   - interpretation:
-    - `05` is now effectively in the same overhead class on this cheap case
+    - the schedule-level trivial-parallel fast path turned this into a major
+      win for `05`
 - `run_parallelism / layer_barrier_stress`
-  - `experiment_05`: about `1.354 ms .. 1.639 ms`
-  - `experiment_03`: about `1.626 ms .. 2.020 ms`
+  - `experiment_05`: about `590.29 µs .. 594.72 µs`
+  - `experiment_03`: about `588.73 µs .. 594.12 µs`
   - interpretation:
-    - cluster draining is paying off
+    - `05` is now effectively tied with `03` on this barrier-heavy case
 - `run_parallelism / portfolio_bridge_tradeoff / pre96...post32...`
-  - `experiment_05`: about `644.96 µs .. 910.91 µs`
-  - `experiment_03`: about `1.320 ms .. 1.356 ms`
+  - `experiment_05`: about `500.33 µs .. 508.44 µs`
+  - `experiment_03`: about `528.47 µs .. 531.91 µs`
   - `experiment_04`: about `1.351 ms .. 1.394 ms`
   - interpretation:
-    - revised clustering plus local dynamic policy clearly won here
-- `run_parallelism / portfolio_bridge_tradeoff / pre32...post96...`
-  - `experiment_05`: about `526.51 µs .. 531.63 µs`
-  - `experiment_03`: about `1.354 ms .. 1.408 ms`
-  - `experiment_04`: about `1.320 ms .. 1.390 ms`
-  - interpretation:
-    - this is a very strong win for `05`
+    - `05` now beats both `03` and `04` on the pre-heavy bridge shape
 - `run_parallelism / mixed_hotspots / blocks48`
-  - `experiment_05`: about `1.550 ms .. 1.694 ms`
-  - `experiment_03`: about `2.473 ms .. 2.876 ms`
+  - `experiment_05`: about `1.511 ms .. 1.535 ms`
+  - `experiment_03`: about `1.508 ms .. 1.560 ms`
   - interpretation:
-    - the revised clusterer helped materially on mixed conflict/locality
-      structure
+    - `05` is now in the same class as `03` on this mixed locality/conflict
+      workload instead of trailing badly
 
-### Current Weak Spot
+### Current Weak Spots
 
 - `run_overhead / hot_key_write_contention / jobs256_zero`
-  - `experiment_05`: about `46.91 µs .. 49.33 µs`
-  - `experiment_03`: about `15.62 µs .. 16.35 µs`
+  - `experiment_05`: about `7.75 µs .. 8.34 µs`
+  - `experiment_03`: about `6.10 µs .. 6.36 µs`
   - interpretation:
-    - `05` still pays too much bookkeeping on a fully serialized zero-work
-      writer hotspot
+    - the serial fast path helped enormously, but `03` is still ahead on the
+      pure zero-work serialized hotspot
+- `run_parallelism / portfolio_bridge_tradeoff / pre32...post96...`
+  - `experiment_05`: about `535.46 µs .. 537.79 µs`
+  - `experiment_03`: about `493.49 µs .. 501.20 µs`
+  - `experiment_04`: about `1.320 ms .. 1.390 ms`
+  - interpretation:
+    - `05` still loses this bridge orientation to `03`, even though it remains
+      far ahead of `04`
 
 ### Compile Cost
 
@@ -798,17 +826,22 @@ repeated-run runtime speed.
 
 The hierarchical cluster direction is now grounded enough to keep.
 
-The prototype is not yet “all-around best,” but it is no longer speculative:
+The prototype is now substantially stronger than the first `05` version.
 
-- it is competitive with `03` on at least one important `0ms` overhead case
-- it clearly beats `03` and `04` on the bridge-tradeoff workloads
-- it beats `03` on barrier-heavy and mixed-hotspot workloads
-- it exposes one specific remaining weakness: serialized hotspot overhead
+- it now beats `03` very clearly on `wide_independent/jobs512_zero`
+- it ties `03` on `layer_barrier_stress`
+- it beats `03` and `04` on the pre-heavy bridge shape
+- it is in the same class as `03` on `mixed_hotspots`
+- it is still behind `03` on:
+  - zero-work serialized write hotspots
+  - the post-heavy bridge orientation
 
-That means the next likely improvement is not a different representation
-entirely. It is a fast path for singleton or fully serial clusters so `05`
-stops paying extra cluster bookkeeping where clustering gives no runtime
-benefit.
+That means the next likely improvements are:
+
+- keep the cluster-automata representation
+- add a better local policy or cluster shape for the post-heavy bridge
+  orientation
+- continue shrinking the residual gap on the pure serialized hotspot path
 
 ## Files Added So Far
 
@@ -864,3 +897,11 @@ for all of the following:
   `layer_barrier_stress`, dramatically faster on both
   `portfolio_bridge_tradeoff` shapes, and much faster on `mixed_hotspots`,
   while still lagging on `hot_key_write_contention/jobs256_zero`.
+- 2026-04-05: Added a second optimization round with explicit cluster runtime
+  modes, work-first inter-cluster chaining, cheaper `done_mask` publication,
+  and a schedule-level trivial-parallel fast path.
+- 2026-04-05: Reran the key benchmarks sequentially and found that `05` now
+  wins decisively on `wide_independent/jobs512_zero`, ties `03` on
+  `layer_barrier_stress`, beats `03` on the pre-heavy bridge shape, stays close
+  to `03` on `mixed_hotspots`, and narrows the serialized hotspot gap from
+  roughly `47-49 µs` down to roughly `7.7-8.3 µs`.
