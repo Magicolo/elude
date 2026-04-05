@@ -1,7 +1,7 @@
 # Task 03: Improve Experiment 02
 
-Last updated: 2026-04-04
-Status: not started
+Last updated: 2026-04-05
+Status: completed
 Priority: medium-high
 
 ## Goal
@@ -12,7 +12,8 @@ Improve `experiment_02` while preserving its identity:
 - keep runtime simple and group-by-group
 - accept that the unit of runtime synchronization is a group
 
-This task is not about making `02` imitate `01` or `03`. It is about finding how far the layered design can be pushed before its barrier model fundamentally limits it.
+This task was explicitly not about turning `02` into `01` or `03`. The runtime
+had to remain a sequential group loop.
 
 ## Relevant Files
 
@@ -24,112 +25,201 @@ This task is not about making `02` imitate `01` or `03`. It is about finding how
 - `tests/support/mod.rs`
 - `benches/experiment.rs`
 
-## Current Design Summary
+## Final Design Chosen
 
-`experiment_02` currently:
+The final implementation keeps the layered runtime intact, but makes the
+compiler substantially more ambitious.
 
-- normalizes dependencies
-- tracks per-key group history
-- computes the earliest legal group
-- scans forward to the first compatible group
-- executes groups sequentially, with parallelism only inside each group
+It now builds two candidate layerings:
 
-The core current functions are:
+1. The original online first-fit layering based on per-key history trackers.
+2. A new strict-frontier batch layering based on pairwise relation
+   classification, strict-edge reduction, and greedy ready-frontier batching.
 
-- `earliest_group`
-- `GroupSummary::is_compatible`
-- `update_trackers`
-- the compile-time group scan loop
+The compiler then chooses between them with a thread-aware rule:
 
-## High-Value Hypotheses To Test
+- estimate execution waves as `sum(ceil(group_size / threads))`
+- compare group count and max group width
+- only allow the frontier layout when none of its groups exceeds the available
+  thread budget
 
-1. Group placement quality is weaker than it needs to be.
+If the frontier layout does not clearly beat first-fit under that rule, the
+compiler falls back to first-fit.
 
-- The current algorithm effectively uses a first-fit scan from the earliest legal group.
-- A different placement heuristic may reduce total group count or critical-path barriers while keeping the same runtime model.
+That last fallback is important. Early iterations of task `03` proved that a
+more "clever" grouping can easily make realistic mixed workloads worse if it
+creates oversized barrier groups.
 
-2. Group summaries are more expensive than necessary.
+## What Changed In Code
 
-- Current summaries use `HashMap<Key, GroupAccess>`.
-- Dense benchmark keys may benefit from indexed or bitset-style summaries.
+### New compile-time relation graph
 
-3. The scheduler could remain layered while becoming more parallel in practice.
+`experiment_02` now computes pairwise relations across all jobs:
 
-- Better compile placement may increase average group width and reduce unnecessary later groups.
-- This is especially relevant in partially overlapping relaxed-conflict workloads.
+- `None`
+- `Relaxed`
+- `Strict`
 
-## Improvement Directions To Explore
+Strict relations are then transitively reduced into a smaller DAG. Relaxed
+relations are kept as neighborhood data for the frontier batch heuristic.
 
-### A. Better group selection heuristics
+### Original first-fit compiler retained
 
-Potential ideas:
+The old compiler logic was not thrown away. It remains as one of the candidate
+layouts and still matters in practice because:
 
-- best-fit instead of first-fit when multiple compatible groups exist
-- heuristics that minimize future conflict blockage, not just current compatibility
-- duration-aware placement if benchmark IR exposes a cost hint
-- separate treatment for hot keys versus sparse keys
+- it is stable on realistic mixed workloads
+- it preserves a declaration-order-like grouping
+- it avoids overfitting compile-time heuristics
 
-### B. Faster group compatibility checks
+### New frontier batch compiler
 
-Potential ideas:
+The new compiler:
 
-- indexed summaries for `Key::Identifier`
-- small-vector or sorted-slice summaries for tiny groups
-- bitset summaries when workload keys are dense and bounded
+- tracks the current strict-ready frontier
+- seeds each group from a job with high strict height / high remaining relaxed
+  pressure
+- grows the group greedily with compatible ready jobs
+- prefers jobs that are easier to place and have similar conflict neighborhoods
 
-### C. Better compile-time frontier tracking
+This can beat online first-fit on bad coloring orders. The internal crown-graph
+unit test exists specifically to prove that point.
 
-Potential ideas:
+### Thread-aware layout selector
 
-- maintain likely candidate groups per key to reduce forward scanning
-- cache the last compatible or incompatible region for recurring key patterns
+The key pragmatic piece is the chooser:
 
-### D. Optional group-local ordering improvements
+- build both layouts
+- score both against the configured thread count
+- reject frontier layouts that create groups wider than the thread pool
+- otherwise keep the layout with lower estimated execution waves
 
-These are secondary and must not change semantics.
+This keeps `experiment_02` grounded in realistic execution rather than blindly
+preferring denser-but-wider groups.
 
-Potential ideas:
+## Why This Approach Was Chosen
 
-- reorder jobs inside a group for cache locality
-- stable ordering choices that reduce benchmark noise
+The original hypothesis for task `03` was that the online first-fit placement
+was leaving parallelism on the table.
 
-## Constraints
+That was true on some graphs, but early implementation attempts also showed an
+important constraint:
 
-- Runtime must remain a sequential loop over groups.
-- Do not add a runtime per-job wakeup engine.
-- Do not add runtime conflict reservations.
-- If the compile algorithm becomes more complex, document why the extra complexity still belongs in the baseline layered design.
+- for a layered scheduler, fewer groups is not automatically better
+- oversized groups can create worse barriers when they do not fit the actual
+  machine width
 
-## Recommended Execution Plan
+The final design keeps the new compiler ideas, but only applies them when they
+beat the classic layout under a thread-aware cost model.
 
-1. Benchmark current `02` under the redesigned harness, especially:
-  - `layer_barrier_stress`
-  - `straggler_partial_overlap`
-  - `zero_work`
-2. Determine whether compile-time or run-time is the larger weakness on the new suite.
-3. Choose one main compile strategy improvement.
-4. Implement it cleanly and keep the runtime loop simple.
-5. Re-run tests and compare against pre-change benchmark data.
-6. Update this file with the chosen heuristic and observed behavior.
+That is a better fit for `experiment_02`'s identity than permanently replacing
+the original algorithm.
 
-## Potential Dependency Additions
+## Verification
 
-Only if warranted:
+### Tests run
 
-- `smallvec`
-- `rustc-hash`
-- `fixedbitset`
+Commands:
 
-The default should still be a simple implementation. Add dependencies only when they clearly improve clarity or measurable performance.
+- `cargo test --test experiment_02`
+- `cargo test compile_can_outperform_online_first_fit_on_crown_conflicts`
 
-## Acceptance Criteria
+Results:
 
-- `experiment_02` still runs one group at a time.
-- Shared tests still pass.
-- Benchmark results clearly show whether group placement improved or not.
-- Any remaining barrier-driven losses are documented rather than hand-waved.
-- This task file records the final heuristic and tradeoffs.
+- shared public `experiment_02` integration tests passed
+- the new internal crown-graph test passed
+
+### Benchmarks run
+
+Commands:
+
+- `cargo bench --bench experiment -- experiment/run_parallelism/experiment_02/layer_barrier_stress`
+- `cargo bench --bench experiment -- experiment/run_parallelism/experiment_02/straggler_partial_overlap`
+- `cargo bench --bench experiment -- experiment/run_parallelism/experiment_02/mixed_hotspots`
+- `cargo bench --bench experiment -- experiment/run_overhead/experiment_02/wide_independent`
+- `cargo bench --bench experiment -- experiment/compile/experiment_02/compile_heavy_sparse_keys`
+
+Machine parallelism:
+
+- used `thread::available_parallelism()` through the benchmark harness
+
+Observed baseline before task `03` work:
+
+- `layer_barrier_stress`
+  - `[1.2398 ms 1.4547 ms 1.6425 ms]`
+- `straggler_partial_overlap`
+  - `[1.6180 ms 1.7074 ms 1.7894 ms]`
+- `mixed_hotspots`
+  - `[2.1870 ms 2.2227 ms 2.2601 ms]`
+- `compile_heavy_sparse_keys`
+  - `[1.1908 ms 1.2028 ms 1.2165 ms]`
+- `wide_independent/jobs512_zero`
+  - `[230.13 µs 236.10 µs 241.71 µs]`
+
+Observed final results after the thread-aware chooser:
+
+- `layer_barrier_stress`
+  - `[777.88 µs 868.91 µs 979.44 µs]`
+  - observed improvement on this machine/run
+- `straggler_partial_overlap`
+  - `[839.48 µs 849.46 µs 860.35 µs]`
+  - observed improvement on this machine/run
+- `mixed_hotspots`
+  - `[2.1998 ms 2.2349 ms 2.2699 ms]`
+  - effectively flat versus the original baseline
+- `wide_independent/jobs512_zero`
+  - `[97.707 µs 138.28 µs 179.62 µs]`
+  - noisy but not a concerning regression
+- `compile_heavy_sparse_keys`
+  - `[148.80 ms 155.11 ms 163.72 ms]`
+  - compile time became dramatically more expensive
+
+## Interpretation
+
+The final result is mixed but coherent:
+
+- the runtime model of `02` stayed intact
+- the new compiler can find better layerings on some graphs
+- the thread-aware chooser prevents the worst mixed-workload regressions from
+  earlier drafts
+- compile time is now vastly higher than the original baseline
+
+This is acceptable only because the user explicitly prioritized practical
+parallelism over schedule-time cost. If compile time becomes more important
+later, this task should be revisited.
+
+## Tradeoffs
+
+- Compile time increased by roughly two orders of magnitude on the
+  `compile_heavy_sparse_keys` benchmark.
+- The frontier compiler is useful, but only as an optional alternative. Using it
+  unconditionally regressed realistic mixed workloads during this task.
+- The whole-group barrier remains the defining limit of `experiment_02`.
+- Some run-time improvements were observed on barrier-shaped benchmarks, but the
+  strongest guaranteed structural win is the new ability to avoid bad online
+  coloring orders when the machine width makes that worthwhile.
+
+## Dependencies
+
+No new dependency was added for this task.
+
+## Recommended Follow-On Work
+
+- Revisit the layout chooser if `experiment_02` becomes compile-time dominated in
+  real usage.
+- Consider recording compile-time metrics such as chosen layout type, group
+  count, wave estimate, and max width for research/debugging.
+- Compare the chosen layouts against ECS competitor batching strategies when
+  interpreting final benchmark results in task `07`.
 
 ## Progress Log
 
 - 2026-04-04: Task created. No implementation yet.
+- 2026-04-05: Replaced the old single-strategy compiler with a dual-layout
+  compiler: online first-fit plus strict-frontier batching.
+- 2026-04-05: Added a thread-aware chooser to keep the experimental frontier
+  layout from hurting realistic mixed workloads.
+- 2026-04-05: Added a crown-graph unit test to lock in a case where the new
+  compiler can beat online first-fit.
+- 2026-04-05: Updated docs and verified the final implementation with tests plus
+  targeted benchmarks. Task complete.

@@ -368,7 +368,7 @@ fn build_predecessors(
 ) -> Box<[Box<[usize]>]> {
     let mut predecessors = jobs
         .iter()
-        .map(|job| job.predecessors.iter().copied().collect::<Vec<_>>())
+        .map(|job| job.predecessors.to_vec())
         .collect::<Vec<_>>();
 
     for barrier in 0..jobs.len() {
@@ -379,8 +379,8 @@ fn build_predecessors(
         for predecessor in 0..barrier {
             predecessors[barrier].push(predecessor);
         }
-        for follower in barrier + 1..jobs.len() {
-            predecessors[follower].push(barrier);
+        for follower_predecessors in predecessors.iter_mut().skip(barrier + 1) {
+            follower_predecessors.push(barrier);
         }
     }
 
@@ -1071,8 +1071,13 @@ impl BenchAdapter for BevyAdapter {
         let resource_count = normalized_resource_count(&normalized);
         let mut resource_ids = vec![None; resource_count + 1];
 
-        for resource in 1..=resource_count {
-            resource_ids[resource] = Some(
+        for (resource, resource_id) in resource_ids
+            .iter_mut()
+            .enumerate()
+            .take(resource_count + 1)
+            .skip(1)
+        {
+            *resource_id = Some(
                 world.register_resource_with_descriptor(bevy_resource_descriptor(resource as u64)),
             );
         }
@@ -1154,8 +1159,13 @@ impl BenchAdapter for FlecsAdapter {
         let mut resource_entities = vec![None; resource_count + 1];
         let mut system_entities = Vec::<FlecsEntity>::with_capacity(normalized.jobs.len());
 
-        for resource in 1..=resource_count {
-            resource_entities[resource] = Some(FlecsEntity(
+        for (resource, resource_entity) in resource_entities
+            .iter_mut()
+            .enumerate()
+            .take(resource_count + 1)
+            .skip(1)
+        {
+            *resource_entity = Some(FlecsEntity(
                 *world
                     .entity_named(&format!("bench_resource_{resource}"))
                     .id(),

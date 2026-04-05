@@ -1,7 +1,7 @@
 # Scheduler Experiment Task Plan
 
-Last updated: 2026-04-04
-Plan status: tasks `00`, `01`, and `05` completed, remaining experiment tasks not started
+Last updated: 2026-04-05
+Plan status: tasks `00`, `01`, `02`, `03`, and `05` completed, remaining experiment tasks not started
 
 ## Mission
 
@@ -52,8 +52,8 @@ Tasks `02`, `03`, and `04` can overlap conceptually once task `01` is in place, 
 | --- | --- | --- | --- |
 | `00-current-state.md` | Completed | none | Cold-start summary of the existing repo and likely bottlenecks |
 | `01-benchmark-foundation.md` | Completed | partial input from `05` | Refactor benchmarks into a reusable comparison framework and add new workloads |
-| `02-experiment-01.md` | Not started | `01` preferred | Improve the dynamic reservation scheduler while preserving its identity |
-| `03-experiment-02.md` | Not started | `01` preferred | Improve the layered baseline while keeping it a layered scheduler |
+| `02-experiment-01.md` | Completed | `01` preferred | Improve the dynamic reservation scheduler while preserving its identity |
+| `03-experiment-02.md` | Completed | `01` preferred | Improve the layered baseline while keeping it a layered scheduler |
 | `04-experiment-03.md` | Not started | `01` preferred | Improve the static DAG scheduler while keeping it a static DAG scheduler |
 | `05-external-libraries.md` | Completed | none | Research, select, integrate, and document external schedulers for comparison |
 | `06-experiment-04.md` | Not started | `01`, `05`, plus findings from `02-04` | Design and implement the new contrastive experiment |
@@ -102,3 +102,5 @@ If you are starting fresh, read `task/00-current-state.md` next.
 - 2026-04-04: Completed task `01` with a refactored benchmark IR, local adapter layer, standard `0ms` suite, and new parallelism-oriented workloads.
 - 2026-04-04: Completed task `05` first by integrating `dagga` and `dag_exec`.
 - 2026-04-04: Revised task `05` after the user required direct ECS benchmarking, then integrated `shipyard`, `legion`, `bevy_ecs`, and `flecs` and added one deep-dive task file per ECS competitor.
+- 2026-04-05: Completed task `02` by replacing `experiment_01`'s broad ready-bit rescans with targeted page waiter queues and by improving relaxed page packing with neighborhood-overlap heuristics.
+- 2026-04-05: Completed task `03` by upgrading `experiment_02` to a dual-layout compiler that compares classic first-fit grouping against a stricter frontier-batch heuristic and keeps the better thread-aware layout while preserving the same group-by-group runtime.

@@ -38,7 +38,6 @@ pub(crate) struct Weak {
 }
 
 pub(crate) struct Cluster {
-    pub ready: u32,
     pub bits: AtomicU64,
     pub nodes: Vec<usize>, // TODO: Based on average size of a cluster, use SmallVec?
 }
@@ -366,7 +365,6 @@ fn resolve<S>(
                         left.1.weak.ready = 1 << 0;
                         right.1.weak.ready = 1 << 1;
                         clusters.push(Cluster {
-                            ready: 0,
                             bits: AtomicU64::new(0),
                             nodes: vec![left.0, right.0],
                         });

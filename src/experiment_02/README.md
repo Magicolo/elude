@@ -1,29 +1,24 @@
 # Experiment 02
 
-`experiment_02` is the traditional baseline scheduler in the experimental
-family.
+`experiment_02` is the traditional layered baseline scheduler in the
+experimental family.
 
-Its job is not to be the most ambitious design. Its job is to answer a very
-useful question:
+Its job is not to be the most dynamic design. Its job is to answer a useful
+question:
 
-"How fast and how small can the scheduler runtime be if we compile everything
-into sequential parallel-safe groups and do almost nothing clever while
-executing?"
+"How far can a plain sequential-group scheduler be pushed if the compiler is
+allowed to work much harder while the runtime stays extremely small?"
 
 If you have no context, this is the quickest way to think about it:
 
-- `experiment_01` tries to maximize parallelism with dynamic runtime
-  reservations
-- `experiment_02` accepts some extra serialization in exchange for a much
-  simpler run-time model
+- `experiment_01` maximizes parallelism with dynamic runtime coordination
+- `experiment_02` keeps the runtime group-by-group and pushes experimentation
+  into compile-time group selection
 
 Both implementations share the same public API from
 [`crate::experiment`](../experiment):
 
 `Scheduler::new().add(Job::new(..)).schedule()?.run(&state)?`
-
-That shared API is the whole point. The project wants to compare complete
-scheduler implementations, not benchmark their internals in isolation.
 
 ## Why This Experiment Exists
 
@@ -31,8 +26,8 @@ Any serious scheduler experiment needs a baseline that is:
 
 - easy to reason about
 - easy to verify
-- cheap to run repeatedly
-- structurally different from the more ambitious design
+- cheap to execute repeatedly
+- structurally different from the more ambitious runtimes
 
 `experiment_02` is that baseline.
 
@@ -44,11 +39,10 @@ It represents the familiar approach used by many dependency schedulers:
 4. run every job in group 1 in parallel
 5. continue until the schedule is done
 
-That design is intentionally conservative. It may not expose the absolute
-maximum parallelism available in the job graph, but it has attractive
-properties:
+That design is intentionally conservative. It will never expose the full
+fine-grained overlap of a dynamic scheduler, but it has attractive properties:
 
-- very small runtime state
+- tiny runtime state
 - simple execution flow
 - no scheduler-managed synchronization during execution
 - easy repeated runs of a compiled schedule
@@ -66,8 +60,9 @@ experiments.
 - `Unknown` behaves like a strict barrier
 
 The public API gives each job `&S`, not `&mut S`. That is required for sound
-parallel execution. The scheduler is preserving declared logical access
-semantics, not handing out unique whole-state references.
+parallel execution. The scheduler preserves declared logical access semantics;
+actual mutation must happen through interior mutability or finer-grained
+synchronization inside `S`.
 
 Each individual job is validated before compilation:
 
@@ -75,53 +70,54 @@ Each individual job is validated before compilation:
 - `Read(key)` together with `Write(key)` in the same job is rejected
 - multiple `Write(key)` accesses to the same key in the same job are rejected
 
-That prevents a single job from declaring an internally unsound access pattern
-and then slipping through scheduling.
-
 ## High-Level Strategy
 
-`experiment_02` pushes all scheduling decisions into compile time.
+`experiment_02` now treats compile time as the place to explore alternatives,
+while keeping one invariant fixed:
 
-At compile time it decides:
+- runtime execution is always a sequential loop over precomputed groups
 
-- which jobs must come after which earlier jobs because of strict conflicts
-- which jobs may share a group because they are overlap-safe
-- how to flatten those groups into dense runtime arrays
+At compile time it builds two candidate layouts:
 
-At run time it only does this:
+### Online First-Fit Layout
 
-1. take the next precomputed group
-2. run that group's jobs in parallel on Rayon
-3. wait for the group to finish
-4. move to the next group
+This is the classic baseline:
 
-No dependency counters are decremented at run time. No wakeup lists are walked.
-No page reservations are acquired. No scheduler-owned atomics are updated.
+- track the earliest legal group from per-key history
+- scan forward to the first compatible group
+- append the job there
 
-That is the core appeal of this design.
+It preserves declaration order aggressively and tends to be stable on realistic
+mixed workloads.
 
-## How It Differs From Experiment 01
+### Frontier Batch Layout
 
-The difference between the two experiments is not the dependency model. It is
-where the scheduler pays for its decisions.
+This is the more experimental compiler:
 
-### Experiment 01
+- classify pairwise relations up front
+- reduce strict edges
+- maintain the strict-ready frontier
+- build one maximal compatible group from that frontier at a time
+- seed on jobs that are hard to place or unlock longer strict chains
+- grow the group with compatible jobs that are easy to pack and have similar
+  conflict neighborhoods
 
-- pays more at runtime
-- uses atomics and dynamic reservation
-- aims to start jobs as soon as their true constraints allow
-- tries to recover parallelism hidden by group barriers
+This can outperform online first-fit on some graphs, especially when the online
+ordering is a bad coloring order.
 
-### Experiment 02
+### Thread-Aware Layout Selection
 
-- pays more in lost opportunity than in runtime work
-- accepts whole-group barriers
-- uses a simpler compile-time placement algorithm
-- aims for a tiny runtime hot path
+The compiler does not blindly trust the more ambitious layout.
 
-This makes `experiment_02` the right comparison point for the question:
+After building both candidates, it chooses the frontier layout only when:
 
-"Is the extra dynamic machinery of `experiment_01` actually worth it?"
+- its estimated execution-wave cost is lower for the configured thread count
+- and none of its groups exceeds the available thread budget
+
+Otherwise it falls back to the online first-fit layout.
+
+That keeps the runtime simple while avoiding obvious overfitting from the
+heavier compiler.
 
 ## Runtime Representation
 
@@ -134,7 +130,7 @@ The compiled schedule stores only:
 
 Each group stores only a range into the job slice.
 
-That means the runtime loop is conceptually:
+That means the runtime loop is still conceptually:
 
 ```text
 for each group:
@@ -142,8 +138,8 @@ for each group:
     wait until group finishes
 ```
 
-This is about as simple as a parallel scheduler runtime can get while still
-respecting a dependency model richer than a plain "spawn everything" executor.
+No dependency counters are decremented at runtime. No wakeup lists are walked.
+No reservations are acquired. No scheduler-owned atomics are updated.
 
 ## Why This Baseline Is Valuable
 
@@ -155,11 +151,9 @@ benchmarks, then the extra complexity is hard to justify.
 
 It is also useful because it isolates a different design philosophy:
 
-- make compilation smart enough
-- make execution mechanically simple
-- accept that some safe overlap will be missed
-
-That philosophy is often the right tradeoff in practice.
+- try harder at compile time
+- keep execution mechanically simple
+- accept that the barrier model still fundamentally limits overlap
 
 ## Current Implementation Status
 
@@ -168,26 +162,28 @@ That philosophy is often the right tradeoff in practice.
 It currently includes:
 
 - dependency normalization
-- compile-time earliest-group placement
-- group summaries for overlap checks
-- strict-order tracking through per-key history
+- pairwise relation classification
+- strict-edge reduction
+- classic online first-fit grouping
+- an alternative strict-frontier batch builder
+- thread-aware layout selection between those two compilers
 - repeated execution through the shared compiled-schedule API
 - shared correctness tests
 - shared Criterion benchmarks
 
 ## Known Tradeoffs
 
-This design is intentionally not optimal for maximum parallelism.
+The runtime is still intentionally simple, but the compiler is no longer cheap.
 
-The main downside is the group barrier:
+The main tradeoffs are:
 
-- if one job in a group is still running, every job in the next group waits,
-  even if some of them could have started safely
+- compile time is far higher than the original tracker-only baseline
+- the whole-group barrier still exists and is still the defining limitation
+- the smarter compiler can help only when it finds a better group layout, not
+  when the workload is fundamentally barrier-shaped
 
-That means `experiment_02` may underutilize the machine on workloads where the
-dependency graph has a lot of partial overlap between neighboring groups.
-
-The tradeoff is that the runtime is extremely simple and cheap.
+That is acceptable for this experiment because the project has explicitly
+prioritized repeated-run behavior over schedule-time cost.
 
 ## How To Read This Module
 
@@ -201,6 +197,6 @@ If you are new to the codebase, the recommended order is:
 
 ## One-Sentence Summary
 
-`experiment_02` is the compact sequential-layer baseline that maximizes
-compile-time simplification and minimizes runtime scheduler work, even though it
-necessarily gives up some parallelism.
+`experiment_02` is the layered baseline whose runtime stays tiny while the
+compiler explores multiple group layouts and picks the one that best fits the
+available thread budget.

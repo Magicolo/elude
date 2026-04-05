@@ -3,7 +3,7 @@
 ## Status
 
 This document describes the current `experiment_01` design as implemented in
-[`model.rs`](./model.rs), not a hypothetical future rewrite. It should be read
+[`model.rs`](./model.rs), not an abandoned lock-free draft. It should be read
 as both:
 
 - a design explanation for cold readers
@@ -12,7 +12,7 @@ as both:
 
 If you have no context, start with [`README.md`](./README.md) first. That file
 explains why this experiment exists. This document explains exactly how it
-works.
+works today.
 
 ## Problem This Experiment Is Trying To Solve
 
@@ -21,15 +21,15 @@ The project wants a scheduler that:
 - compiles once and runs many times
 - preserves `Read` / `Write` dependency semantics
 - preserves `Strict` / `Relax` ordering semantics
-- avoids mutexes in the run-time hot path
-- keeps per-job execution state small
 - extracts more parallelism than a scheduler that only runs precomputed groups
   sequentially
+- keeps per-job runtime state small and flat
+- tolerates higher compile-time cost if it improves repeated-run behavior
 
 The baseline traditional approach is implemented in
-[`crate::experiment_02`](../experiment_02). That design is intentionally simple:
-jobs are assigned to parallel-safe layers, and the runtime executes one whole
-layer at a time.
+[`crate::experiment_02`](../experiment_02). That design is intentionally
+simple: jobs are assigned to parallel-safe layers, and the runtime executes one
+whole layer at a time.
 
 `experiment_01` exists because that simplicity has a cost:
 
@@ -38,24 +38,26 @@ layer at a time.
 - relaxed conflicts are serialized more than necessary
 - available parallelism is often hidden behind group barriers
 
-This experiment tries to remove those coarse barriers while still compiling most
-of the scheduling work up front.
+This experiment tries to remove those coarse barriers while still compiling
+most of the scheduling work up front.
 
 ## Shared Public Model
 
-The experiment participates in the shared API from [`crate::experiment`](../experiment):
+The experiment participates in the shared API from
+[`crate::experiment`](../experiment):
 
 `Scheduler::new().add(Job::new(..)).schedule()?.run(&state)?`
 
 Jobs receive `&S`, not `&mut S`. That is a critical soundness decision.
-Parallel experimental schedulers must not be able to hand out aliased mutable
-references to the whole state object.
+Parallel experimental schedulers must not hand out aliased mutable references
+to the whole state object.
 
 The intended model is:
 
 - the scheduler enforces logical access constraints through declared
   dependencies
-- the state object exposes interior mutability where real mutation is needed
+- the state object exposes interior mutability or finer-grained synchronization
+  where real mutation is needed
 
 ## Dependency Semantics
 
@@ -80,8 +82,8 @@ The dependency model comes from [`crate::depend`](../depend.rs).
 `Relax` means:
 
 - no overlap is allowed for conflicting accesses
-- but declaration order does not need to be preserved once both jobs are
-  otherwise eligible
+- declaration order does not need to be preserved once both jobs are otherwise
+  eligible
 
 This is the case where the runtime should be free to choose whichever job gets
 the resource first.
@@ -93,15 +95,15 @@ the resource first.
 - no overlap is allowed for conflicting accesses
 - declaration order must be preserved
 
-This introduces a true "must happen after" relation.
+This introduces a true `must happen after` relation.
 
 ### Unknown
 
 `Unknown` is treated as a strict barrier:
 
 - it is always a strict outer conflict
-- it effectively says "do not let anything overlap with this unless you have no
-  better information"
+- it effectively says "do not let anything overlap with this unless you have
+  no better information"
 
 ## Central Design Idea
 
@@ -117,7 +119,7 @@ Strict conflicts are compiled into a reduced DAG representation:
 
 At runtime, that is enough to answer:
 
-- is this job logically eligible to start yet
+- is this job logically eligible yet
 - which jobs become newly eligible when this one finishes
 
 ### 2. Relaxed conflicts become reservation state
@@ -128,25 +130,38 @@ Relaxed conflicts are compiled into page reservation masks:
 - each job stores a sorted acquire list of `(page, mask)` pairs
 - a job may run only if it can reserve every page in that list
 
-This is the part that gives `experiment_01` more flexibility than a layered
-group scheduler. Relaxed conflicts do not become permanent compile-time order.
-They become runtime competition over reservation masks.
+Relaxed conflicts do not become permanent compile-time order. They become
+runtime competition over reservation masks.
+
+### 3. Blocked relaxed work uses targeted page waiters
+
+The original ready-bit and follower-page design proved the model was possible,
+but it did too much broad retry work under hot contention. The current design
+therefore keeps the page-reservation model but changes the wakeup strategy:
+
+- when a job fails to reserve a page, it rolls back earlier reservations
+- it queues itself on the first blocking page
+- when reservations are released on a page, that page wakes a bounded set of
+  queued jobs whose masks might now fit
+
+This preserves the identity of the experiment while avoiding repeated whole-page
+rescans of jobs that are still blocked elsewhere.
 
 ## Why Pages Exist
 
 Pages are the fixed-size reservation domain for relaxed conflicts.
 
 Each page can represent up to 32 resident jobs because its state fits in a
-single `AtomicU64`:
+single `AtomicU32`:
 
-- low 32 bits are reservation bits
-- high 32 bits are ready bits
+- each bit corresponds to one resident slot
+- a set bit means that slot is currently reserved by a running job
 
 Pages exist for three reasons:
 
 1. they bound the reservation domain to a small atomic word
 2. they allow related relaxed-conflict neighborhoods to be packed together
-3. they provide a natural unit for wakeups and rescans
+3. they provide a natural wakeup unit for blocked relaxed work
 
 The important subtlety is that a job is not restricted to only one page. It has
 a home page, but its relaxed conflicts may require reservation bits from
@@ -167,23 +182,25 @@ Each job stores:
 - `home: { page, slot }`
 - `strict_wait_initial`
 - `strict_wait`
+- `waiting_on`
 - `successor_range`
 - `acquire_range`
 
 The job does not store:
 
 - explicit predecessor lists
-- rivalry lists
-- weak edge lists
-- cluster metadata beyond its home page/slot
+- permanent rivalry lists
+- per-job heap nodes for wakeups
 
 ### Per page
 
 Each page stores:
 
-- one `AtomicU64 state`
-- `resident_range`
-- `follower_range`
+- one `AtomicU32 state`
+- one `parking_lot::Mutex<VecDeque<JobId>> waiters`
+
+The mutex is intentionally narrow. It protects only queue operations, not the
+whole run loop.
 
 ### Global flat arrays
 
@@ -191,8 +208,6 @@ The schedule also stores flat boxed slices for:
 
 - `successors`
 - `acquires`
-- `residents`
-- `followers`
 - `roots`
 
 The design goal is simple: runtime traversal should mostly mean pointer chasing
@@ -217,10 +232,6 @@ not internally contradictory:
 - read/write on the same key inside one job is rejected
 - write/write on the same key inside one job is rejected
 
-This is required because a single job must not be allowed to describe
-internally overlapping exclusive accesses and still be accepted by the
-scheduler.
-
 If multiple dependencies mention the same key:
 
 - their order is merged using the maximum order
@@ -238,8 +249,8 @@ relation as one of:
 - `Relaxed`
 - `Strict`
 
-This is currently an `O(n^2)` pass, which is acceptable for the experiment
-because the schedule is expected to run many times after being compiled.
+This is an `O(n^2)` pass, which is acceptable for the experiment because the
+schedule is expected to run many times after being compiled.
 
 ### Step 3: reduce strict edges
 
@@ -251,322 +262,212 @@ therefore performs a local transitive reduction:
 - obviously redundant strict edges are removed
 - the result is a smaller predecessor set per job
 
-This keeps strict wakeup traffic lower without needing a fully general graph
-data structure at runtime.
+This keeps strict wakeup traffic lower without needing a full graph runtime.
 
-### Step 4: build the relaxed-conflict neighborhood graph
+### Step 4: build the relaxed-conflict graph
 
 Relaxed conflicts are treated as an undirected compile-time graph.
 
-This graph is not kept at runtime. It is only used to answer:
+This graph is not stored directly at runtime. It is used only to decide page
+placement and acquire masks.
 
-- which jobs should be grouped into the same reservation neighborhoods
-- which jobs need reservation masks against each other
+### Step 5: pack relaxed neighborhoods into pages
 
-### Step 5: assign home pages
+The current page assignment is more intentional than the original
+degree-sorted chunking pass.
 
-Jobs are assigned a home page and slot.
+For each connected relaxed-conflict component:
 
-The current heuristic is intentionally simple:
+- isolated jobs are handled separately and packed densely
+- non-isolated components are broken into 32-slot pages
+- the first seed of a page is the highest-degree remaining job
+- the rest of the page is filled greedily with jobs whose relaxed neighborhoods
+  most overlap with the page so far
 
-- connected relaxed-conflict components are discovered
-- within a component, jobs are ordered by relaxed degree
-- jobs are chunked into pages of at most 32 residents
-- isolated jobs are also packed into pages
+The affinity heuristic combines:
 
-This is a practical heuristic, not a theoretical optimum. The purpose is to get
-reasonably dense conflict neighborhoods into the same page so that acquire lists
-stay short and page-local scans are more productive.
+- direct relaxed edges to jobs already on the page
+- overlap in closed relaxed neighborhoods
 
-### Step 6: emit acquire lists
+The goal is not to solve graph partitioning optimally. The goal is to reduce:
 
-For each job:
+- acquire-list span across many pages
+- cross-page wake traffic
+- accidental fragmentation of one logical hotspot across many pages
 
-- the compiler includes its home page in the acquire list
-- the compiler adds acquire bits for every page containing relaxed-conflict
-  neighbors
-- acquire entries on the same page are merged into a single bitmask
-- the final acquire list is sorted by page id
+### Step 6: build acquire masks
 
-The sorted global page order is crucial. It means all jobs reserve pages in the
-same order, which prevents deadlock during multi-page acquisition.
+Each job always acquires at least one bit: its own home slot.
 
-### Step 7: emit residents and followers
+For each relaxed neighbor, the compiler adds the neighbor's home slot bit.
+Those bits are then coalesced by page into a sorted list of `Acquire` entries.
 
-Each page needs two kinds of metadata:
+At runtime, the job must reserve every page in this list before it can run.
 
-- which jobs are resident in the page
-- which other pages may contain jobs blocked by this page
+### Step 7: emit dense runtime arrays
 
-Those second pages are called followers. They allow the runtime to propagate
-wakeups at page granularity instead of retaining explicit weak-edge lists.
+Once predecessors, successors, page placement, and acquires are known, the
+compiler emits:
+
+- `Node` records
+- `Page` records
+- flat successor storage
+- flat acquire storage
+- root jobs
+
+The result is a reusable compiled schedule that can be run repeatedly.
 
 ## Runtime Algorithm
 
-The runtime is centered around three operations:
+## Entry condition
 
-- attempt to start a job
-- run a job
-- rescan a page
+When `run()` starts:
 
-### Attempting a job
+- every job with zero strict predecessors is considered a root
+- each root is passed to `attempt_job`
+- no global ready queue is built
 
-A job can only start if:
+The runtime discovers more work from:
 
-1. its strict predecessor count is zero
-2. every page in its acquire list can be reserved
+- strict successor counters reaching zero
+- waiter queues on released pages
 
-The runtime checks the strict counter first. If it is nonzero, the job is not
-yet eligible.
+### `attempt_job`
 
-If the job is strictly eligible, the runtime walks its acquire list in page-id
-order. For each page:
+`attempt_job(job)` performs the following checks in order:
 
-- load the current page state
-- check whether any needed reservation bit is already held
-- if not, CAS in the new reservation word
+1. return immediately if the run was cancelled
+2. return if the job is already queued on a blocking page
+3. return if the job still has unfinished strict predecessors
+4. walk the job's sorted acquire list and try to reserve each page atomically
 
-If every page reservation succeeds, the job is spawned.
+If every reservation succeeds:
 
-If any reservation fails:
+- the job is spawned into the Rayon scope
 
-- already-acquired pages are released in reverse order
-- the job marks its ready bit in its home page
-- the runtime returns immediately
+If some reservation fails:
 
-The job does not block. It simply records that it wants to run once the relevant
-page activity changes.
+- earlier successful reservations are rolled back
+- the job is queued on the first blocking page
 
-### Lost-wakeup prevention
+Choosing the first blocking page is deliberate. It minimizes wake noise because
+the job only waits on a page that is definitely preventing progress.
 
-There is an important race around failed reservation:
+### Reservation mechanics
 
-- a job may fail to reserve a page
-- then mark itself ready in its home page
-- while the conflicting reservation is released at nearly the same time
+Page reservation uses compare-and-swap on the page's `AtomicU32`.
 
-To avoid missing that transition, the runtime performs an additional check after
-marking ready. If the page that caused the failure is now free for the needed
-mask, the runtime proactively rescans the job's home page.
+For a requested mask:
 
-This is one of the most subtle parts of the design and is required to make the
-ready-bit wakeup scheme reliable.
+- if any needed bit is already set, reservation fails
+- otherwise the bits are atomically ORed in
 
-### Running a job
+Because every job acquires its own home slot bit, duplicate concurrent starts of
+the same job are prevented without a separate runtime node state machine.
 
-Once spawned, the job simply executes its closure.
+### Queueing blocked jobs
 
-After completion the runtime:
+If a job fails on page `P`:
 
-1. releases all acquired page masks
-2. restores the job's strict wait counter to its initial value
-3. scans the job's home page
-4. scans follower pages of every released page
-5. decrements strict successors and attempts newly unblocked ones
+- it records `waiting_on = P`
+- it pushes its `JobId` into `P.waiters`
+- it immediately rechecks whether `P` is still blocking the needed mask
 
-That order matters:
+That final recheck closes the lost-wakeup race where the page becomes free
+between the failed acquire and the queue insertion. If the page is already
+usable, the job removes itself from the queue and retries immediately.
 
-- reservations must be released before rescans
-- home/follower rescans expose relaxed-conflict progress
-- strict successor decrements expose ordering progress
+### `run_job`
 
-### Page scans
+When a spawned job finishes successfully, the runtime:
 
-A page scan loads the page's ready bits and iterates resident jobs whose ready
-bit is set. Each such job is re-attempted.
+1. releases all acquired page bits
+2. resets the job's strict counter to its initial value for future runs
+3. decrements strict successors and directly attempts any that become ready
+4. wakes waiter queues on each released page
 
-The page scan does not need to know why the job became blocked. It only needs to
-know that some condition related to that page may have changed.
+If the job returns an error:
 
-This is a key simplification:
+- cancellation is set
+- the first error is retained
+- the schedule is reset before the run returns
 
-- there are no per-job wait queues
-- there are no explicit rival vectors
-- the page is the wakeup domain
+### Waking waiters
 
-## Repeated Execution Model
+Page wakeups are intentionally bounded.
 
-The schedule is designed to run many times.
+For a released page, the runtime:
 
-On successful completion:
+- inspects the current page reservation bits
+- scans the page's waiter queue in FIFO order
+- selects a bounded set of queued jobs whose masks on that page do not conflict
+  with already-selected masks
+- clears their `waiting_on` state
+- re-attempts them outside the page queue lock
 
-- every page state should have returned to zero
-- every job's strict wait counter should have returned to its initial value
+This is the core contrast with the older rescan design. The page does not
+retry every resident job blindly. It only wakes jobs that were actually blocked
+by this page and that have a plausible chance to fit now.
 
-That means the schedule is naturally reusable without a full reset pass after
-every successful iteration.
+## Correctness Notes
 
-On error:
+### Why a job acquires its own home bit
 
-- the runtime currently performs an explicit reset of page state and strict wait
-  counters before returning
+The home bit is doing real work:
 
-This keeps the post-error state predictable even though the happy path is tuned
-to avoid extra reset work.
+- it gives the job a stable identity inside the page model
+- it prevents duplicate concurrent starts of the same job
+- it keeps the acquire model uniform even for jobs with no relaxed neighbors
 
-## Correctness Invariants
+### Why waiting on the first failed page is safe
 
-The implementation depends on a small number of important invariants.
+When a job fails while walking sorted acquires:
 
-### Invariant 1: strict order is preserved
+- every earlier page in the list was available at that moment
+- the failed page is therefore a real blocker
+- later pages are irrelevant until that blocker is cleared
 
-If job `B` has a strict predecessor `A`, then `B` must not start until `A` has
-finished. This is enforced by the predecessor counter and successor wakeup path.
+Waking on the first failed page is therefore a sound targeted retry strategy.
 
-### Invariant 2: relaxed conflicts never overlap
+### Why strict and relaxed mechanisms stay separate
 
-If two jobs have a relaxed conflict, then at least one of them must fail page
-reservation while the other is running. This is enforced by acquire masks.
+Strict edges mean semantic order. Relaxed conflicts mean only non-overlap.
 
-### Invariant 3: page reservation cannot deadlock
+Merging them into one runtime queue would make the algorithm harder to reason
+about and easier to accidentally over-serialize. Keeping them separate lets the
+runtime:
 
-Every job acquires pages in the same ascending page order. Failed acquisitions
-roll back immediately. Therefore the runtime cannot deadlock on reservation
-ordering.
+- react immediately to true order completion through successor counters
+- keep relaxed competition dynamic through reservation masks
 
-### Invariant 4: wakeups are page-complete enough
+## Tradeoffs
 
-If a page release could make some blocked job runnable, then either:
+The current design improves hot-contention behavior substantially, but the
+tradeoffs are explicit:
 
-- the releasing job scans the relevant page or follower page, or
-- the blocked job's failed-acquire path triggers a compensating rescan
+- compile-time page packing is costlier than simple degree chunking
+- the runtime now uses narrow mutexes for waiter queues
+- fairness is improved by queueing, but not formally guaranteed
+- page wakeups are still heuristic because a released page cannot know whether a
+  woken job will later fail on another page
 
-This is what makes the ready-bit and follower-page model viable.
+Those tradeoffs are acceptable for this experiment because the project has
+explicitly prioritized practical repeated-run parallelism over minimal
+schedule-time cost.
 
-### Invariant 5: runtime state stays compact
-
-No job needs to retain heavy graph state during execution. All runtime behavior
-must be derivable from:
-
-- its strict counter
-- its acquire list
-- its home page
-- the flat successor/follower arrays
-
-## Why This Design Can Outperform Layered Scheduling
-
-The design is trying to exploit a specific opportunity:
-
-- strict dependencies are often much sparser than "whole earlier group must
-  finish"
-- relaxed conflicts often do not justify a permanent order
-
-By treating relaxed conflicts as dynamic reservation rather than layered order,
-`experiment_01` can run jobs earlier when:
-
-- their true strict predecessors are already done
-- their needed reservation masks are currently available
-
-That lets the runtime overlap work that a group scheduler would serialize.
-
-## Why This Design Is More Complex
-
-The extra parallelism is not free.
-
-Compared with `experiment_02`, this design has:
-
-- more compile-time machinery
-- more runtime atomics
-- more subtle wakeup behavior
-- sensitivity to page assignment quality
-
-This is acceptable only if the extra parallelism actually shows up in the
-benchmarks. That is why `experiment_01` and `experiment_02` share the same API
-tests and the same benchmark harness.
-
-## Heap Allocation Strategy
-
-The runtime representation is intentionally flattened into boxed slices to avoid
-capacity waste and to keep memory traversal predictable:
-
-- jobs are stored in one boxed slice
-- pages are stored in one boxed slice
-- successors are stored in one boxed slice
-- acquires are stored in one boxed slice
-- residents are stored in one boxed slice
-- followers are stored in one boxed slice
-- roots are stored in one boxed slice
-
-Compile-time helper structures still use temporary `Vec`s because clarity and
-iteration speed matter more than squeezing the compile pipeline at this stage.
-
-## Complexity Profile
-
-Current rough costs:
-
-- dependency normalization: per-job sort and merge
-- pairwise relation detection: `O(n^2)`
-- strict reduction: higher than linear, but done once at compile time
-- page assignment: linear in the relaxed graph size plus sorting within
-  components
-- runtime job attempt: proportional to acquire-list length
-- runtime wakeup cost: proportional to resident page scans and successor/follower
-  fan-out
-
-This is the intended shape:
-
-- heavier compile
-- lighter repeated runs
-- dynamic runtime decisions only where they buy parallelism
-
-## Failure And Error Handling
-
-Job closures return `anyhow::Result<()>`.
-
-If a job returns an error:
-
-- the schedule is marked cancelled
-- the error is collected
-- no new useful work should be started after cancellation is observed
-
-The schedule is then reset to a reusable state before the error is surfaced.
-
-This part of the design is deliberately conservative. The primary focus of the
-experiment is scheduling performance, not sophisticated partial-failure policy.
-
-## Limitations And Open Questions
-
-The current implementation is strong enough to benchmark, but several questions
-remain open.
-
-### Page assignment quality
-
-The current heuristic is simple and deterministic, but it may not be the best
-packing for:
-
-- long acquire lists
-- cross-page follower traffic
-- cache locality
-
-### Compile-time cost
-
-The pairwise relation pass is deliberately brute-force. If compile time becomes
-a problem, key-indexed acceleration or sparse conflict discovery may be needed.
-
-### Wakeup efficiency
-
-Page-level rescans avoid per-job rivalry lists, but the best follower strategy
-is still an empirical question.
-
-### Fairness
-
-The design aims for throughput, not fairness guarantees. If one ready job keeps
-winning reservation races, another may be retried many times before running.
-
-## How To Evaluate This Experiment
+## What To Compare Against
 
 When comparing `experiment_01` to other schedulers, the important questions are:
 
-- does it produce measurably better run-time throughput on mixed workloads
-- does that gain persist across repeated runs of the same compiled schedule
-- is the extra compile-time cost acceptable
-- is the flatter runtime representation enough to justify the more dynamic logic
+- does the extra dynamic machinery uncover parallelism that layered schedulers
+  miss
+- does the targeted waiter design keep contention costs under control
+- does better page packing reduce acquire span in mixed-hotspot workloads
+- is the compile-time cost justified by repeated-run behavior
 
-That is the standard this experiment should be held to.
-
-## One-Paragraph Mental Model
+## Summary
 
 `experiment_01` compiles strict dependencies into predecessor counters and flat
-successor lists, compiles relaxed conflicts into page reservation masks, and
-then uses small atomic page states plus ready-bit rescans to start jobs as soon
-as both their ordering constraints and their reservation constraints allow it.
+successor lists, compiles relaxed conflicts into multi-page reservation masks,
+and uses small page-local waiter queues to retry blocked work only where the
+actual contention occurred.

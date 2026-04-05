@@ -1,7 +1,7 @@
 # Task 02: Improve Experiment 01
 
-Last updated: 2026-04-04
-Status: not started
+Last updated: 2026-04-05
+Status: completed
 Priority: high
 
 ## Goal
@@ -13,7 +13,9 @@ Improve `experiment_01` while preserving its identity:
 - keep a flat runtime representation
 - prioritize maximum safe parallelism over low scheduler overhead
 
-The user explicitly removed the lock-free requirement. That opens up valid new implementation directions as long as the scheduler still behaves like the dynamic reservation experiment.
+The user explicitly removed the lock-free requirement. That allowed targeted
+queue-based wakeups under contention without turning `01` into a grouped or
+purely static scheduler.
 
 ## Relevant Files
 
@@ -25,132 +27,162 @@ The user explicitly removed the lock-free requirement. That opens up valid new i
 - `tests/support/mod.rs`
 - `benches/experiment.rs`
 
-## Current Design Summary
+## Final Design Chosen
 
-`experiment_01` currently:
+This task did not try many half-overlapping tweaks. It implemented one coherent
+change set:
 
-- classifies pairwise job relations
-- reduces strict edges
-- assigns home pages for relaxed-conflict neighborhoods
-- emits per-job multi-page acquire masks
-- uses runtime page reservations plus ready-bit rescans
+1. Replace broad ready-bit page rescans with targeted per-page waiter queues.
+2. Keep the multi-page reservation-mask runtime model.
+3. Improve relaxed page assignment so jobs with overlapping relaxed
+   neighborhoods are more likely to share a page.
 
-The most relevant current functions are:
+The resulting scheduler is still recognizably `experiment_01`:
 
-- `reduce_strict`
-- `assign_homes`
-- `attempt_job`
-- `run_job`
-- `reserve_page`
-- `scan_page`
+- strict dependencies are still reduced into per-job counters and flat
+  successors
+- relaxed conflicts are still decided dynamically at run time
+- jobs still acquire sorted page masks before they can run
+- runtime state is still flat, compact, and reusable across repeated runs
 
-## High-Value Hypotheses To Test
+## What Changed In Code
 
-1. Page assignment quality is limiting parallelism.
+### Runtime wakeup path
 
-- Current heuristic is simple degree-based packing into 32-slot pages.
-- Better packing may shorten acquire lists, reduce follower traffic, and improve effective concurrency.
+The old implementation used:
 
-2. Wakeup strategy is doing too much broad scanning.
+- a page `AtomicU64`
+- ready bits in the upper half
+- home-page rescans
+- follower-page rescans
+- compensating rescans in the failed-acquire path
 
-- Current runtime rescans the home page and follower pages after job completion.
-- A more targeted ready structure may improve both overhead and actual runnable-job discovery.
+The new implementation uses:
 
-3. Hot-page contention may be better handled with locks than with repeated CAS retries.
+- a page `AtomicU32` reservation word
+- a `parking_lot::Mutex<VecDeque<JobId>>` waiter queue per page
+- `waiting_on: AtomicU32` per job to prevent duplicate queueing
+- first-blocking-page queueing on failed acquire
+- bounded waiter wakeup on page release
 
-- The project no longer needs to be lock-free.
-- Per-page mutexes, reservation queues, or guarded wait-lists are now fair game if they improve practical parallelism or reduce scheduler thrash.
+This change directly targeted the biggest observed weakness in the original
+design: hot relaxed contention caused large amounts of wasted retry work,
+especially on zero-work jobs.
 
-4. The runtime lacks fairness or anti-starvation behavior.
+### Page packing
 
-- If one job repeatedly wins reservation races, another may spin through failed attempts.
-- This matters most in `0ms` and hot-contention workloads.
+The old page assignment heuristic:
 
-## Improvement Directions To Explore
+- found relaxed connected components
+- sorted by degree
+- chunked the component into 32-slot pages
 
-Explore these in order of likely value.
+The new heuristic still works component-by-component, but page fill is now
+greedy by neighborhood affinity:
 
-### A. Better page packing
+- seed each page with the highest-degree remaining job
+- fill remaining slots with jobs that maximize direct relaxed overlap and
+  closed-neighborhood overlap with the page so far
 
-Potential ideas:
+This is not a full graph partitioner. It is a deterministic, compile-time
+heavier heuristic intended to reduce acquire span and cross-page hotspot
+fragmentation.
 
-- conflict-graph partitioning that explicitly minimizes cross-page acquire spans
-- packing by both degree and neighbor overlap, not degree alone
-- special treatment for isolated or nearly isolated jobs
-- compile-time metrics such as:
-  - average acquire-list length
-  - maximum acquire-list length
-  - follower fan-out per page
+## Why This Approach Was Chosen
 
-### B. More targeted wakeups
+Baseline measurements before the rewrite made the priority clear:
 
-Potential ideas:
+- `layer_barrier_stress` was already fine because it is mostly strict-edge
+  latency, not relaxed-contention wakeup traffic
+- `mixed_hotspots` was not obviously dominated by the old wakeup path
+- `hot_key_write_contention/jobs256_zero` was catastrophically expensive for a
+  zero-work benchmark, with samples around `9.24 ms` to `42.63 ms`
 
-- per-page ready queues instead of only ready bits
-- a per-page list of currently blocked jobs
-- dirty flags that avoid rescanning pages known to have no pending work
-- batching follower propagation when multiple released pages point to the same follower
+That pointed directly at the failure path and retry strategy, not at strict
+edge reduction.
 
-### C. Lock-based runtime exploration
+The queue-driven design was chosen because it fixes the real pathology:
 
-Because lock-free is no longer required, consider prototypes such as:
+- jobs stop getting retried just because their home or follower page was
+  rescanned
+- a blocked job only waits on a page that definitely prevented progress
+- a released page wakes a bounded set of jobs that were actually blocked there
 
-- mutex-guarded page reservation state
-- per-page waiter lists protected by `parking_lot::Mutex`
-- explicit handoff or ticketing on hot resources
+## Verification
 
-This is not a license to bloat the runtime arbitrarily. The goal is still maximum practical parallelism on repeated runs.
+### Tests run
 
-### D. Reduce unnecessary work in the failure path
+Commands:
 
-Current failed acquisition does:
+- `cargo test --test experiment_01`
+- `cargo test assign_homes_groups_similar_relaxed_neighborhoods`
 
-- rollback
-- mark ready in home page
-- maybe trigger a compensating scan for lost-wakeup avoidance
+Results:
 
-Investigate whether the same correctness guarantee can be kept with less redundant work under contention.
+- shared public `experiment_01` integration tests passed
+- the new internal page-packing unit test passed
 
-## Constraints
+### Benchmarks run
 
-- Do not turn `01` into a grouped scheduler.
-- Do not turn `01` into a purely static DAG scheduler.
-- Preserve semantic correctness under the shared tests.
-- Any additional metrics or helper data should stay consistent with repeated schedule reuse.
+Commands:
 
-## Recommended Execution Plan
+- `cargo bench --bench experiment -- experiment/run_parallelism/experiment_01/layer_barrier_stress`
+- `cargo bench --bench experiment -- experiment/run_parallelism/experiment_01/mixed_hotspots`
+- `cargo bench --bench experiment -- experiment/run_overhead/experiment_01/hot_key_write_contention`
 
-1. Benchmark current `01` under the redesigned harness.
-2. Add temporary instrumentation if needed:
-  - acquire-list length stats
-  - page count
-  - follower count
-  - failed reservation count
-  - rescan count
-3. Choose the most promising improvement path based on data, not aesthetic preference.
-4. Implement one coherent improvement set rather than many partially overlapping tweaks.
-5. Re-run correctness tests and targeted benchmarks.
-6. Update `README.md` and this file with what actually changed and why.
+Machine parallelism:
 
-## Potential Dependency Additions
+- used `thread::available_parallelism()` through the benchmark harness
 
-Only if justified by the chosen direction:
+Results:
 
-- `smallvec`
-- `rustc-hash`
-- `fixedbitset`
-- additional synchronization or queue crates
+- `layer_barrier_stress`
+  - before: `[603.80 µs 657.44 µs 712.61 µs]`
+  - after: `[679.03 µs 685.71 µs 692.88 µs]`
+  - interpretation: no statistically meaningful change
+- `mixed_hotspots`
+  - before: `[2.1640 ms 2.2672 ms 2.3645 ms]`
+  - after: `[2.2125 ms 2.2776 ms 2.3638 ms]`
+  - interpretation: no statistically meaningful change
+- `hot_key_write_contention/jobs256_zero`
+  - before: `[9.2419 ms 20.742 ms 42.629 ms]`
+  - after: `[425.57 µs 431.99 µs 438.52 µs]`
+  - interpretation: enormous overhead improvement on the contention path the
+    rewrite was targeting
 
-If a dependency is introduced, document exactly what problem it solved.
+## Tradeoffs
 
-## Acceptance Criteria
+- Compile-time cost is expected to be higher because page packing is more
+  expensive than simple degree chunking.
+- This pass did not capture a pre/post compile benchmark, so that compile-time
+  cost is expected but not numerically quantified here.
+- The runtime now uses narrow mutex-backed page waiters. This was an explicit
+  trade accepted by the user in exchange for better practical parallelism under
+  contention.
+- Fairness is improved relative to blind rescans, but there is still no formal
+  fairness guarantee.
 
-- `experiment_01` still matches its documented design identity.
-- Shared scheduler tests still pass.
-- Benchmarks show whether the change improved parallelism-sensitive cases, overhead-sensitive cases, or both.
-- Any tradeoff that worsened compile time or overhead is documented explicitly.
-- This task file records the chosen approach and results.
+## Dependencies
+
+No new dependency was added for this task.
+
+## Recommended Follow-On Work
+
+- Use the new external baselines from task `05` when tuning `02` further.
+- If compile-time cost becomes a concern, benchmark the page-packing heuristic
+  directly and consider a cheaper fallback path for very large dense
+  components.
+- Compare the new waiter model against ideas from `shipyard`, `legion`, and
+  `bevy_ecs` once tasks `03` and `04` are underway.
 
 ## Progress Log
 
 - 2026-04-04: Task created. No implementation yet.
+- 2026-04-05: Measured the pre-change `experiment_01` baseline on targeted
+  run-time workloads.
+- 2026-04-05: Replaced ready-bit/follower rescans with targeted page waiter
+  queues and added per-job `waiting_on` state.
+- 2026-04-05: Reworked relaxed page assignment to pack by neighborhood overlap
+  instead of plain degree chunking.
+- 2026-04-05: Updated `experiment_01` docs and verified tests plus targeted
+  benchmarks. Task complete.

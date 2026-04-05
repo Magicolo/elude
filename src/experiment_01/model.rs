@@ -7,15 +7,20 @@ use anyhow::Result;
 use parking_lot::Mutex;
 use rayon::{Scope, ThreadPool, ThreadPoolBuilder};
 use std::{
-    cmp::{Reverse, max},
+    cmp::{max, Reverse},
+    collections::VecDeque,
     num::NonZeroUsize,
     ops::Range,
-    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::*},
+    sync::atomic::{AtomicBool, AtomicU32, Ordering::*},
     thread,
 };
 
 pub type PageId = u32;
 pub type JobId = u32;
+
+const PAGE_CAPACITY: usize = 32;
+const WAITING_NONE: PageId = PageId::MAX;
+const PAGE_WAKE_LIMIT: usize = 8;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct Home {
@@ -66,6 +71,7 @@ pub struct Node<S> {
     pub home: Home,
     pub strict_wait_initial: u32,
     pub strict_wait: AtomicU32,
+    pub waiting_on: AtomicU32,
     pub successor_range: Range<u32>,
     pub acquire_range: Range<u32>,
 }
@@ -83,6 +89,7 @@ impl<S> Node<S> {
             home,
             strict_wait_initial,
             strict_wait: AtomicU32::new(strict_wait_initial),
+            waiting_on: AtomicU32::new(WAITING_NONE),
             successor_range,
             acquire_range,
         }
@@ -91,17 +98,15 @@ impl<S> Node<S> {
 
 #[derive(Debug)]
 pub struct Page {
-    pub state: AtomicU64,
-    pub resident_range: Range<u32>,
-    pub follower_range: Range<u32>,
+    pub state: AtomicU32,
+    pub waiters: Mutex<VecDeque<JobId>>,
 }
 
 impl Page {
-    pub fn new(resident_range: Range<u32>, follower_range: Range<u32>) -> Self {
+    pub fn new() -> Self {
         Self {
-            state: AtomicU64::new(0),
-            resident_range,
-            follower_range,
+            state: AtomicU32::new(0),
+            waiters: Mutex::new(VecDeque::new()),
         }
     }
 }
@@ -112,8 +117,6 @@ pub struct Schedule<S> {
     pub pages: Box<[Page]>,
     pub successors: Box<[JobId]>,
     pub acquires: Box<[Acquire]>,
-    pub residents: Box<[JobId]>,
-    pub followers: Box<[PageId]>,
     pub roots: Box<[JobId]>,
 }
 
@@ -179,7 +182,6 @@ impl<S: Sync> Schedule<S> {
         }
 
         let mut acquire_lists = vec![Vec::<Acquire>::new(); count];
-        let mut followers_by_page = vec![Vec::<PageId>::new(); pages_count];
         for job in 0..count {
             let home = homes[job];
             let mut raw = Vec::with_capacity(relaxed_neighbors[job].len() + 1);
@@ -197,50 +199,13 @@ impl<S: Sync> Schedule<S> {
                     _ => acquires.push(Acquire::new(page, mask)),
                 }
             }
-            for acquire in acquires.iter() {
-                if acquire.page != home.page {
-                    followers_by_page[acquire.page as usize].push(home.page);
-                }
-            }
             acquire_lists[job] = acquires;
         }
 
-        let mut page_sizes = vec![0u32; pages_count];
-        for home in homes.iter() {
-            page_sizes[home.page as usize] += 1;
-        }
-
-        let mut resident_starts = vec![0u32; pages_count];
-        let mut resident_cursor = 0u32;
-        for (page, &size) in page_sizes.iter().enumerate() {
-            resident_starts[page] = resident_cursor;
-            resident_cursor += size;
-        }
-
-        let mut residents = vec![0; count];
-        for (job, home) in homes.iter().enumerate() {
-            let resident = resident_starts[home.page as usize] as usize + home.slot as usize;
-            residents[resident] = job as JobId;
-        }
-
         let mut pages = Vec::with_capacity(pages_count);
-        let mut followers = Vec::new();
         if pages_count > 0 {
-            for page in 0..pages_count {
-                let page_followers = &mut followers_by_page[page];
-                page_followers.sort_unstable();
-                page_followers.dedup();
-
-                let follower_start = followers.len() as u32;
-                followers.extend(page_followers.iter().copied());
-                let follower_end = followers.len() as u32;
-                let resident_start = resident_starts[page];
-                let resident_end = resident_start + page_sizes[page];
-
-                pages.push(Page::new(
-                    resident_start..resident_end,
-                    follower_start..follower_end,
-                ));
+            for _ in 0..pages_count {
+                pages.push(Page::new());
             }
         }
 
@@ -277,8 +242,6 @@ impl<S: Sync> Schedule<S> {
             pages: pages.into_boxed_slice(),
             successors: successors.into_boxed_slice(),
             acquires: acquires.into_boxed_slice(),
-            residents: residents.into_boxed_slice(),
-            followers: followers.into_boxed_slice(),
             roots: roots.into_boxed_slice(),
         })
     }
@@ -301,12 +264,14 @@ impl<S: Sync> Schedule<S> {
 
         let mut errors = errors.into_inner();
         if errors.is_empty() {
-            debug_assert!(self.pages.iter().all(|page| page.state.load(Relaxed) == 0));
-            debug_assert!(
-                self.jobs
-                    .iter()
-                    .all(|job| job.strict_wait.load(Relaxed) == job.strict_wait_initial)
-            );
+            debug_assert!(self
+                .pages
+                .iter()
+                .all(|page| { page.state.load(Relaxed) == 0 && page.waiters.lock().is_empty() }));
+            debug_assert!(self.jobs.iter().all(|job| {
+                job.strict_wait.load(Relaxed) == job.strict_wait_initial
+                    && job.waiting_on.load(Relaxed) == WAITING_NONE
+            }));
             Ok(())
         } else {
             self.reset();
@@ -317,9 +282,11 @@ impl<S: Sync> Schedule<S> {
     fn reset(&self) {
         for page in self.pages.iter() {
             page.state.store(0, Relaxed);
+            page.waiters.lock().clear();
         }
         for job in self.jobs.iter() {
             job.strict_wait.store(job.strict_wait_initial, Relaxed);
+            job.waiting_on.store(WAITING_NONE, Relaxed);
         }
     }
 }
@@ -359,24 +326,20 @@ fn normalize_dependencies(dependencies: Vec<Dependency>) -> Result<NormalizedDep
             Some(previous) if previous.key == access.key => {
                 let order = max(previous.order, access.order);
                 if previous.write && access.write {
-                    return Err(
-                        ScheduleError::WriteWriteConflict(
-                            previous.key.clone(),
-                            crate::depend::Scope::Inner,
-                            order,
-                        )
-                        .into(),
-                    );
+                    return Err(ScheduleError::WriteWriteConflict(
+                        previous.key.clone(),
+                        crate::depend::Scope::Inner,
+                        order,
+                    )
+                    .into());
                 }
                 if previous.write || access.write {
-                    return Err(
-                        ScheduleError::ReadWriteConflict(
-                            previous.key.clone(),
-                            crate::depend::Scope::Inner,
-                            order,
-                        )
-                        .into(),
-                    );
+                    return Err(ScheduleError::ReadWriteConflict(
+                        previous.key.clone(),
+                        crate::depend::Scope::Inner,
+                        order,
+                    )
+                    .into());
                 }
                 previous.order = order;
             }
@@ -453,6 +416,7 @@ fn assign_homes(relaxed_neighbors: &[Vec<JobId>]) -> Vec<Home> {
         .map(|neighbors| neighbors.len())
         .collect::<Vec<_>>();
     let mut visited = vec![false; len];
+    let mut local_indices = vec![usize::MAX; len];
     let mut isolated = Vec::<JobId>::new();
     let mut homes = vec![Home { page: 0, slot: 0 }; len];
     let mut next_page = 0u32;
@@ -480,8 +444,8 @@ fn assign_homes(relaxed_neighbors: &[Vec<JobId>]) -> Vec<Home> {
             }
         }
 
-        component.sort_unstable_by_key(|&current| (Reverse(degrees[current as usize]), current));
-        for chunk in component.chunks(32) {
+        let packed = pack_component(&component, relaxed_neighbors, &degrees, &mut local_indices);
+        for chunk in packed.iter() {
             for (slot, &job) in chunk.iter().enumerate() {
                 homes[job as usize] = Home {
                     page: next_page,
@@ -492,7 +456,8 @@ fn assign_homes(relaxed_neighbors: &[Vec<JobId>]) -> Vec<Home> {
         }
     }
 
-    for chunk in isolated.chunks(32) {
+    isolated.sort_unstable_by_key(|&job| (Reverse(degrees[job as usize]), job));
+    for chunk in isolated.chunks(PAGE_CAPACITY) {
         for (slot, &job) in chunk.iter().enumerate() {
             homes[job as usize] = Home {
                 page: next_page,
@@ -502,6 +467,106 @@ fn assign_homes(relaxed_neighbors: &[Vec<JobId>]) -> Vec<Home> {
         next_page += 1;
     }
     homes
+}
+
+fn pack_component(
+    component: &[JobId],
+    relaxed_neighbors: &[Vec<JobId>],
+    degrees: &[usize],
+    local_indices: &mut [usize],
+) -> Vec<Vec<JobId>> {
+    if component.len() <= PAGE_CAPACITY {
+        let mut page = component.to_vec();
+        page.sort_unstable_by_key(|&job| (Reverse(degrees[job as usize]), job));
+        return vec![page];
+    }
+
+    for (local, &job) in component.iter().enumerate() {
+        local_indices[job as usize] = local;
+    }
+
+    let words = component.len().div_ceil(64);
+    let mut closed = vec![vec![0u64; words]; component.len()];
+    for (local, &job) in component.iter().enumerate() {
+        bit_set(&mut closed[local], local);
+        for &neighbor in relaxed_neighbors[job as usize].iter() {
+            let neighbor_local = local_indices[neighbor as usize];
+            if neighbor_local != usize::MAX {
+                bit_set(&mut closed[local], neighbor_local);
+            }
+        }
+    }
+
+    let mut remaining = component.to_vec();
+    let mut pages = Vec::with_capacity(component.len().div_ceil(PAGE_CAPACITY));
+    while !remaining.is_empty() {
+        let seed_index = remaining
+            .iter()
+            .enumerate()
+            .max_by_key(|&(_, &job)| (degrees[job as usize], Reverse(job)))
+            .map(|(index, _)| index)
+            .unwrap();
+        let seed = remaining.swap_remove(seed_index);
+        let mut page = vec![seed];
+
+        while page.len() < PAGE_CAPACITY && !remaining.is_empty() {
+            let candidate_index = remaining
+                .iter()
+                .enumerate()
+                .max_by_key(|&(_, &candidate)| {
+                    page_affinity(
+                        candidate,
+                        &page,
+                        relaxed_neighbors,
+                        degrees,
+                        local_indices,
+                        &closed,
+                    )
+                })
+                .map(|(index, _)| index)
+                .unwrap();
+            page.push(remaining.swap_remove(candidate_index));
+        }
+
+        page.sort_unstable_by_key(|&job| (Reverse(degrees[job as usize]), job));
+        pages.push(page);
+    }
+
+    for &job in component.iter() {
+        local_indices[job as usize] = usize::MAX;
+    }
+
+    pages
+}
+
+fn page_affinity(
+    candidate: JobId,
+    page: &[JobId],
+    relaxed_neighbors: &[Vec<JobId>],
+    degrees: &[usize],
+    local_indices: &[usize],
+    closed: &[Vec<u64>],
+) -> (u32, u32, usize, Reverse<JobId>) {
+    let candidate_local = local_indices[candidate as usize];
+    let candidate_closed = &closed[candidate_local];
+    let candidate_neighbors = &relaxed_neighbors[candidate as usize];
+    let mut overlap = 0u32;
+    let mut direct = 0u32;
+
+    for &member in page.iter() {
+        let member_local = local_indices[member as usize];
+        overlap += bit_intersection_count(candidate_closed, &closed[member_local]);
+        direct += candidate_neighbors.binary_search(&member).is_ok() as u32;
+    }
+
+    (
+        overlap
+            .saturating_mul(4)
+            .saturating_add(direct.saturating_mul(16)),
+        direct,
+        degrees[candidate as usize],
+        Reverse(candidate),
+    )
 }
 
 #[inline]
@@ -521,6 +586,14 @@ fn bit_or(left: &mut [u64], right: &[u64]) {
     }
 }
 
+#[inline]
+fn bit_intersection_count(left: &[u64], right: &[u64]) -> u32 {
+    left.iter()
+        .zip(right.iter())
+        .map(|(left, right)| (left & right).count_ones())
+        .sum()
+}
+
 fn attempt_job<'context, 'schedule, 'state, 'sync, 'scope, S: Sync>(
     context: &'context RunContext<'schedule, 'state, 'sync, S>,
     job: JobId,
@@ -536,37 +609,35 @@ fn attempt_job<'context, 'schedule, 'state, 'sync, 'scope, S: Sync>(
     }
 
     let node = &context.schedule.jobs[job as usize];
+    if node.waiting_on.load(Acquire) != WAITING_NONE {
+        return;
+    }
     if node.strict_wait.load(Acquire) != 0 {
         return;
     }
 
     let acquires = job_acquires(context.schedule, node);
+    debug_assert!(acquires.iter().any(|acquire| {
+        acquire.page == node.home.page && (acquire.mask & node.home.ready_bit()) != 0
+    }));
     let mut reserved = 0usize;
+    let mut failed = None;
     for acquire in acquires.iter() {
-        let ready_clear = if acquire.page == node.home.page {
-            node.home.ready_bit()
-        } else {
-            0
-        };
         if reserve_page(
             &context.schedule.pages[acquire.page as usize].state,
             acquire.mask,
-            ready_clear,
         ) {
             reserved += 1;
         } else {
-            rollback(context.schedule, &acquires[..reserved]);
-            mark_ready(
-                &context.schedule.pages[node.home.page as usize].state,
-                node.home.ready_bit(),
-            );
-            let failed_page = &context.schedule.pages[acquire.page as usize];
-            let failed_lock = failed_page.state.load(Acquire) as u32;
-            if failed_lock & acquire.mask == 0 {
-                scan_page(context, node.home.page, scope);
-            }
-            return;
+            failed = Some(*acquire);
+            break;
         }
+    }
+
+    if let Some(failed) = failed {
+        rollback(context.schedule, &acquires[..reserved]);
+        enqueue_waiter(context, job, failed.page, failed.mask, scope);
+        return;
     }
 
     scope.spawn(move |scope| run_job(context, job, scope));
@@ -585,27 +656,19 @@ fn run_job<'context, 'schedule, 'state, 'sync, 'scope, S: Sync>(
     let node = &context.schedule.jobs[job as usize];
     let acquires = job_acquires(context.schedule, node);
     let result = (node.run)(context.state);
-    let home_page = node.home.page;
-
     release(context.schedule, acquires);
     node.strict_wait.store(node.strict_wait_initial, Release);
 
     match result {
         Ok(()) if !context.cancelled.load(Acquire) => {
-            scan_page(context, home_page, scope);
-            for acquire in acquires.iter() {
-                let page = &context.schedule.pages[acquire.page as usize];
-                for &follower in page_followers(context.schedule, page).iter() {
-                    if follower != home_page {
-                        scan_page(context, follower, scope);
-                    }
-                }
-            }
             for &successor in job_successors(context.schedule, node).iter() {
                 let successor_node = &context.schedule.jobs[successor as usize];
                 if successor_node.strict_wait.fetch_sub(1, AcqRel) == 1 {
                     attempt_job(context, successor, scope);
                 }
+            }
+            for acquire in acquires.iter() {
+                wake_waiters(context, acquire.page, scope);
             }
         }
         Ok(()) => {}
@@ -617,20 +680,20 @@ fn run_job<'context, 'schedule, 'state, 'sync, 'scope, S: Sync>(
 }
 
 #[inline]
-fn reserve_page(state: &AtomicU64, mask: u32, clear_ready: u32) -> bool {
-    let mask = u64::from(mask);
-    let clear_ready = u64::from(clear_ready) << 32;
+fn reserve_page(state: &AtomicU32, mask: u32) -> bool {
     loop {
         let current = state.load(Acquire);
         if current & mask != 0 {
             return false;
         }
 
-        let next = (current | mask) & !clear_ready;
+        let next = current | mask;
 
-        match state.compare_exchange_weak(current, next, AcqRel, Acquire) {
-            Ok(_) => return true,
-            Err(_) => {}
+        if state
+            .compare_exchange_weak(current, next, AcqRel, Acquire)
+            .is_ok()
+        {
+            return true;
         }
     }
 }
@@ -648,19 +711,47 @@ fn release<S>(schedule: &Schedule<S>, acquires: &[Acquire]) {
 }
 
 #[inline]
-fn release_mask(state: &AtomicU64, mask: u32) {
-    let keep_ready = (u64::from(u32::MAX)) << 32;
-    state.fetch_and(keep_ready | u64::from(!mask), Release);
+fn release_mask(state: &AtomicU32, mask: u32) {
+    state.fetch_and(!mask, Release);
 }
 
-#[inline]
-fn mark_ready(state: &AtomicU64, bit: u32) {
-    state.fetch_or((u64::from(bit)) << 32, Release);
-}
-
-fn scan_page<'context, 'schedule, 'state, 'sync, 'scope, S: Sync>(
+fn enqueue_waiter<'context, 'schedule, 'state, 'sync, 'scope, S: Sync>(
     context: &'context RunContext<'schedule, 'state, 'sync, S>,
+    job: JobId,
     page: PageId,
+    mask: u32,
+    scope: &Scope<'scope>,
+) where
+    'context: 'scope,
+    'schedule: 'scope,
+    'state: 'scope,
+    'sync: 'scope,
+{
+    let node = &context.schedule.jobs[job as usize];
+    if node
+        .waiting_on
+        .compare_exchange(WAITING_NONE, page, AcqRel, Acquire)
+        .is_err()
+    {
+        return;
+    }
+
+    let blocked_page = &context.schedule.pages[page as usize];
+    let mut waiters = blocked_page.waiters.lock();
+    waiters.push_back(job);
+
+    if blocked_page.state.load(Acquire) & mask == 0 {
+        let removed = waiters.pop_back();
+        debug_assert_eq!(removed, Some(job));
+        node.waiting_on.store(WAITING_NONE, Release);
+        drop(waiters);
+        attempt_job(context, job, scope);
+    }
+}
+
+fn wake_waiters<'context, 'schedule, 'state, 'sync, 'scope, S: Sync>(
+    context: &'context RunContext<'schedule, 'state, 'sync, S>,
+    page_id: PageId,
     scope: &Scope<'scope>,
 ) where
     'context: 'scope,
@@ -672,16 +763,40 @@ fn scan_page<'context, 'schedule, 'state, 'sync, 'scope, S: Sync>(
         return;
     }
 
-    let page = &context.schedule.pages[page as usize];
-    let residents =
-        &context.schedule.residents[page.resident_range.start as usize..page.resident_range.end as usize];
-    let mut pending = (page.state.load(Acquire) >> 32) as u32;
-    while pending != 0 {
-        let slot = pending.trailing_zeros() as usize;
-        pending &= pending - 1;
-        if slot < residents.len() {
-            attempt_job(context, residents[slot], scope);
+    let page = &context.schedule.pages[page_id as usize];
+    let mut reserved = page.state.load(Acquire);
+    let mut ready = Vec::with_capacity(PAGE_WAKE_LIMIT);
+    let mut waiters = page.waiters.lock();
+    let mut index = 0usize;
+
+    while index < waiters.len() && ready.len() < PAGE_WAKE_LIMIT {
+        let job = waiters[index];
+        let node = &context.schedule.jobs[job as usize];
+        if node.waiting_on.load(Acquire) != page_id {
+            waiters.remove(index);
+            continue;
         }
+
+        let Some(mask) = acquire_mask_for_page(context.schedule, node, page_id) else {
+            waiters.remove(index);
+            node.waiting_on.store(WAITING_NONE, Release);
+            continue;
+        };
+
+        if reserved & mask == 0 {
+            let job = waiters.remove(index).expect("waiter index must exist");
+            node.waiting_on.store(WAITING_NONE, Release);
+            ready.push(job);
+            reserved |= mask;
+        } else {
+            index += 1;
+        }
+    }
+
+    drop(waiters);
+
+    for job in ready {
+        attempt_job(context, job, scope);
     }
 }
 
@@ -702,11 +817,11 @@ fn job_successors<'schedule, S>(
 }
 
 #[inline]
-fn page_followers<'schedule, S>(
-    schedule: &'schedule Schedule<S>,
-    page: &Page,
-) -> &'schedule [PageId] {
-    &schedule.followers[page.follower_range.start as usize..page.follower_range.end as usize]
+fn acquire_mask_for_page<S>(schedule: &Schedule<S>, node: &Node<S>, page: PageId) -> Option<u32> {
+    job_acquires(schedule, node)
+        .binary_search_by_key(&page, |acquire| acquire.page)
+        .ok()
+        .map(|index| job_acquires(schedule, node)[index].mask)
 }
 
 #[cfg(test)]
@@ -775,16 +890,22 @@ mod tests {
     #[test]
     fn relation_distinguishes_none_relaxed_and_strict() {
         let none = relation(
-            &normalize_dependencies(vec![Dependency::Read(Key::Identifier(0), Order::Relax)]).unwrap(),
-            &normalize_dependencies(vec![Dependency::Read(Key::Identifier(0), Order::Strict)]).unwrap(),
+            &normalize_dependencies(vec![Dependency::Read(Key::Identifier(0), Order::Relax)])
+                .unwrap(),
+            &normalize_dependencies(vec![Dependency::Read(Key::Identifier(0), Order::Strict)])
+                .unwrap(),
         );
         let relaxed = relation(
-            &normalize_dependencies(vec![Dependency::Read(Key::Identifier(0), Order::Relax)]).unwrap(),
-            &normalize_dependencies(vec![Dependency::Write(Key::Identifier(0), Order::Relax)]).unwrap(),
+            &normalize_dependencies(vec![Dependency::Read(Key::Identifier(0), Order::Relax)])
+                .unwrap(),
+            &normalize_dependencies(vec![Dependency::Write(Key::Identifier(0), Order::Relax)])
+                .unwrap(),
         );
         let strict = relation(
-            &normalize_dependencies(vec![Dependency::Write(Key::Identifier(0), Order::Relax)]).unwrap(),
-            &normalize_dependencies(vec![Dependency::Write(Key::Identifier(0), Order::Strict)]).unwrap(),
+            &normalize_dependencies(vec![Dependency::Write(Key::Identifier(0), Order::Relax)])
+                .unwrap(),
+            &normalize_dependencies(vec![Dependency::Write(Key::Identifier(0), Order::Strict)])
+                .unwrap(),
         );
 
         assert_eq!(none, Relation::None);
@@ -809,5 +930,24 @@ mod tests {
                 Home { page: 0, slot: 2 },
             ]
         );
+    }
+
+    #[test]
+    fn assign_homes_groups_similar_relaxed_neighborhoods() {
+        let homes = assign_homes(&[
+            vec![1, 2],
+            vec![0, 2],
+            vec![0, 1],
+            vec![4, 5],
+            vec![3, 5],
+            vec![3, 4],
+        ]);
+
+        let first_page = homes[0].page;
+        assert_eq!(homes[1].page, first_page);
+        assert_eq!(homes[2].page, first_page);
+        assert_ne!(homes[3].page, first_page);
+        assert_eq!(homes[4].page, homes[3].page);
+        assert_eq!(homes[5].page, homes[3].page);
     }
 }

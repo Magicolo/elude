@@ -7,7 +7,7 @@ use anyhow::Result;
 use parking_lot::Mutex;
 use rayon::{Scope as RayonScope, ThreadPool, ThreadPoolBuilder};
 use std::{
-    cmp::{Ordering, max},
+    cmp::{max, Ordering},
     collections::HashMap,
     num::NonZeroUsize,
     ops::Range,
@@ -178,11 +178,10 @@ impl<S: Sync> Schedule<S> {
 
         let mut errors = errors.into_inner();
         if errors.is_empty() {
-            debug_assert!(
-                self.jobs
-                    .iter()
-                    .all(|job| job.wait.load(Relaxed) == job.wait_initial)
-            );
+            debug_assert!(self
+                .jobs
+                .iter()
+                .all(|job| job.wait.load(Relaxed) == job.wait_initial));
             Ok(())
         } else {
             self.reset();

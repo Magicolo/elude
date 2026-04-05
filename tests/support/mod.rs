@@ -160,13 +160,25 @@ fn expected_internal_error(dependencies: &[Dependency]) -> Option<ScheduleError>
         let order = state.order.map_or(order, |previous| max(previous, order));
 
         if write && state.read {
-            return Some(ScheduleError::ReadWriteConflict(key.clone(), Scope::Inner, order));
+            return Some(ScheduleError::ReadWriteConflict(
+                key.clone(),
+                Scope::Inner,
+                order,
+            ));
         }
         if !write && state.write {
-            return Some(ScheduleError::ReadWriteConflict(key.clone(), Scope::Inner, order));
+            return Some(ScheduleError::ReadWriteConflict(
+                key.clone(),
+                Scope::Inner,
+                order,
+            ));
         }
         if write && state.write {
-            return Some(ScheduleError::WriteWriteConflict(key.clone(), Scope::Inner, order));
+            return Some(ScheduleError::WriteWriteConflict(
+                key.clone(),
+                Scope::Inner,
+                order,
+            ));
         }
 
         state.order = Some(order);
@@ -224,8 +236,16 @@ where
 
     compiled.run(&()).unwrap();
 
-    assert_eq!(probe.started[0].load(SeqCst), 1, "{label}: first job did not run exactly once");
-    assert_eq!(probe.started[1].load(SeqCst), 1, "{label}: second job did not run exactly once");
+    assert_eq!(
+        probe.started[0].load(SeqCst),
+        1,
+        "{label}: first job did not run exactly once"
+    );
+    assert_eq!(
+        probe.started[1].load(SeqCst),
+        1,
+        "{label}: second job did not run exactly once"
+    );
     assert!(
         !probe.overlap_violation.load(SeqCst),
         "{label}: conflicting jobs overlapped"
@@ -320,9 +340,9 @@ where
                     assert!(started.load(SeqCst), "{label}: valid job did not run");
                 }
                 (Err(error), Some(expected)) => {
-                    let actual = error
-                        .downcast_ref::<ScheduleError>()
-                        .unwrap_or_else(|| panic!("{label}: expected scheduler error, got {error:?}"));
+                    let actual = error.downcast_ref::<ScheduleError>().unwrap_or_else(|| {
+                        panic!("{label}: expected scheduler error, got {error:?}")
+                    });
                     assert_eq!(
                         format!("{actual:?}"),
                         format!("{expected:?}"),
@@ -412,7 +432,11 @@ where
         !violation.load(SeqCst),
         "unknown dependency did not behave as a strict barrier"
     );
-    assert_eq!(stage.load(SeqCst), 3, "barrier sequence did not fully execute");
+    assert_eq!(
+        stage.load(SeqCst),
+        3,
+        "barrier sequence did not fully execute"
+    );
 }
 
 pub fn invalid_internal_conflicts_are_rejected<T>()
@@ -448,7 +472,10 @@ where
             .downcast_ref::<ScheduleError>()
             .unwrap_or_else(|| panic!("{label}: expected scheduler error, got {error:?}"));
 
-        assert!(expected(schedule_error), "{label}: wrong error {schedule_error:?}");
+        assert!(
+            expected(schedule_error),
+            "{label}: wrong error {schedule_error:?}"
+        );
         assert!(
             !started.load(SeqCst),
             "{label}: invalid job must not have been executed"
@@ -584,7 +611,11 @@ where
         "mixed three-job constraints were violated"
     );
     for (index, count) in counts.iter().enumerate() {
-        assert_eq!(count.load(SeqCst), 1, "job {index} did not run exactly once");
+        assert_eq!(
+            count.load(SeqCst),
+            1,
+            "job {index} did not run exactly once"
+        );
     }
 }
 
