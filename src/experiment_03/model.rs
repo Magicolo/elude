@@ -7,7 +7,7 @@ use anyhow::Result;
 use parking_lot::Mutex;
 use rayon::{Scope as RayonScope, ThreadPool, ThreadPoolBuilder};
 use std::{
-    cmp::{max, Ordering},
+    cmp::{max, Ordering, Reverse},
     collections::HashMap,
     num::NonZeroUsize,
     ops::Range,
@@ -133,6 +133,24 @@ impl<S: Sync> Schedule<S> {
             }
         }
 
+        let final_heights = build_final_heights(&priority, &successors_by_job);
+        for successors in successors_by_job.iter_mut() {
+            successors.sort_unstable_by_key(|&job| {
+                (
+                    Reverse(final_heights[job as usize]),
+                    Reverse(rank[job as usize]),
+                    job,
+                )
+            });
+        }
+        roots.sort_unstable_by_key(|&job| {
+            (
+                Reverse(final_heights[job as usize]),
+                Reverse(rank[job as usize]),
+                job,
+            )
+        });
+
         let mut successors = Vec::new();
         let mut nodes = Vec::with_capacity(count);
         for (job, pending) in pending.into_iter().enumerate() {
@@ -171,8 +189,12 @@ impl<S: Sync> Schedule<S> {
         };
 
         self.pool.scope(|scope| {
-            for &root in self.roots.iter() {
-                spawn_job(&context, root, scope);
+            let mut roots = self.roots.iter().copied();
+            if let Some(root) = roots.next() {
+                for root in roots {
+                    spawn_ready(&context, root, scope);
+                }
+                run_ready_chain(&context, root, scope);
             }
         });
 
@@ -520,6 +542,18 @@ fn build_successors(predecessors: &[Vec<JobId>]) -> Vec<Vec<JobId>> {
     successors
 }
 
+fn build_final_heights(priority: &[JobId], successors: &[Vec<JobId>]) -> Vec<u32> {
+    let mut heights = vec![0u32; successors.len()];
+    for &job in priority.iter().rev() {
+        heights[job as usize] = successors[job as usize]
+            .iter()
+            .map(|&successor| heights[successor as usize] + 1)
+            .max()
+            .unwrap_or(0);
+    }
+    heights
+}
+
 #[inline]
 fn bit_set(bits: &mut [u64], index: usize) {
     bits[index / 64] |= 1u64 << (index % 64);
@@ -537,7 +571,7 @@ fn bit_or(left: &mut [u64], right: &[u64]) {
     }
 }
 
-fn spawn_job<'context, 'schedule, 'state, 'sync, 'scope, S: Sync>(
+fn spawn_ready<'context, 'schedule, 'state, 'sync, 'scope, S: Sync>(
     context: &'context RunContext<'schedule, 'state, 'sync, S>,
     job: JobId,
     scope: &RayonScope<'scope>,
@@ -553,12 +587,12 @@ fn spawn_job<'context, 'schedule, 'state, 'sync, 'scope, S: Sync>(
 
     let node = &context.schedule.jobs[job as usize];
     debug_assert_eq!(node.wait.load(Relaxed), 0);
-    scope.spawn(move |scope| run_job(context, job, scope));
+    scope.spawn(move |scope| run_ready_chain(context, job, scope));
 }
 
-fn run_job<'context, 'schedule, 'state, 'sync, 'scope, S: Sync>(
+fn run_ready_chain<'context, 'schedule, 'state, 'sync, 'scope, S: Sync>(
     context: &'context RunContext<'schedule, 'state, 'sync, S>,
-    job: JobId,
+    mut job: JobId,
     scope: &RayonScope<'scope>,
 ) where
     'context: 'scope,
@@ -566,23 +600,41 @@ fn run_job<'context, 'schedule, 'state, 'sync, 'scope, S: Sync>(
     'state: 'scope,
     'sync: 'scope,
 {
-    let node = &context.schedule.jobs[job as usize];
-    let result = (node.run)(context.state);
-    node.wait.store(node.wait_initial, Release);
+    loop {
+        if context.cancelled.load(Acquire) {
+            return;
+        }
 
-    match result {
-        Ok(()) if !context.cancelled.load(Acquire) => {
-            for &successor in job_successors(context.schedule, node).iter() {
-                let successor_node = &context.schedule.jobs[successor as usize];
-                if successor_node.wait.fetch_sub(1, AcqRel) == 1 {
-                    spawn_job(context, successor, scope);
+        let node = &context.schedule.jobs[job as usize];
+        debug_assert_eq!(node.wait.load(Relaxed), 0);
+        let result = (node.run)(context.state);
+        node.wait.store(node.wait_initial, Release);
+
+        match result {
+            Ok(()) if !context.cancelled.load(Acquire) => {
+                let mut next_inline = None;
+                for &successor in job_successors(context.schedule, node).iter() {
+                    let successor_node = &context.schedule.jobs[successor as usize];
+                    if successor_node.wait.fetch_sub(1, AcqRel) == 1 {
+                        if next_inline.is_none() {
+                            next_inline = Some(successor);
+                        } else {
+                            spawn_ready(context, successor, scope);
+                        }
+                    }
+                }
+
+                match next_inline {
+                    Some(successor) => job = successor,
+                    None => return,
                 }
             }
-        }
-        Ok(()) => {}
-        Err(error) => {
-            context.cancelled.store(true, Release);
-            context.errors.lock().push(error);
+            Ok(()) => return,
+            Err(error) => {
+                context.cancelled.store(true, Release);
+                context.errors.lock().push(error);
+                return;
+            }
         }
     }
 }

@@ -1,7 +1,7 @@
 # Task 04: Improve Experiment 03
 
-Last updated: 2026-04-04
-Status: not started
+Last updated: 2026-04-05
+Status: completed
 Priority: high
 
 ## Goal
@@ -27,14 +27,15 @@ This task should push the static-DAG approach as far as it can reasonably go.
 
 ## Current Design Summary
 
-`experiment_03` currently:
+`experiment_03` now:
 
 - builds fixed strict predecessors
 - chooses a topological priority order using a greedy heuristic
+- computes final-DAG heights after edge construction
 - orients relaxed conflicts according to that order
 - compresses per-key edges
 - performs final predecessor reduction
-- runs a flat predecessor-counter DAG executor
+- runs a flat predecessor-counter DAG executor with work-first direct wakeups
 
 The core current functions are:
 
@@ -42,6 +43,8 @@ The core current functions are:
 - `build_job_stats`
 - `build_final_predecessors`
 - `reduce_predecessors_priority_order`
+- `build_final_heights`
+- `run_ready_chain`
 
 ## High-Value Hypotheses To Test
 
@@ -108,15 +111,15 @@ Do not let a general graph library become the runtime data structure.
 1. Benchmark current `03` on the redesigned harness.
 2. Identify the workload families where `03` should beat `02` but does not.
 3. Add compile-time instrumentation if needed:
-  - edge counts before and after reduction
-  - root counts
-  - critical-path estimates
+   - edge counts before and after reduction
+   - root counts
+   - critical-path estimates
 4. Choose one meaningful improvement strategy.
 5. Implement and validate.
 6. Update this file with:
-  - chosen heuristic
-  - compile-time cost change
-  - runtime benchmark effect
+   - chosen heuristic
+   - compile-time cost change
+   - runtime benchmark effect
 
 ## Potential Dependency Additions
 
@@ -135,6 +138,83 @@ Document clearly if a dependency is only used for compile-time graph work.
 - Benchmarks show whether the new compile-time work improved repeated-run behavior.
 - The task file records the actual heuristic chosen and the measured tradeoff.
 
+## Implemented Change
+
+The implemented improvement was not a heavier relaxed-edge search. Benchmarking
+showed that `experiment_03` was underperforming on workloads where the static
+DAG should already have been good enough, especially barrier-heavy and
+partial-overlap cases. That pointed to executor overhead rather than poor
+orientation quality.
+
+The chosen change preserves the same static-DAG identity but improves the
+executor shape:
+
+- compute final-DAG longest-path heights after the final reduced graph exists
+- sort roots and each successor slice by descending final height, then by the
+  original priority rank
+- replace "spawn every ready job" with a work-first ready-chain executor
+- keep one newly ready successor inline on the current worker
+- spawn only additional newly ready successors
+
+This keeps runtime purely DAG-based:
+
+- no runtime conflict reservations
+- no grouped barriers
+- no runtime search for legal jobs
+- no change to dependency semantics
+
+## Why This Was Chosen
+
+The benchmark evidence before the change was:
+
+- `straggler_partial_overlap`: about `1.008 ms .. 1.120 ms`
+- `mixed_hotspots`: about `2.243 ms .. 2.505 ms`
+- `layer_barrier_stress`: about `1.052 ms .. 1.208 ms`
+- `compile_heavy_sparse_keys`: about `25.321 ms .. 27.022 ms`
+
+Those numbers suggested that the static graph itself was acceptable, but the
+executor was paying too much per-ready-node overhead by spawning every newly
+ready job as an independent Rayon task.
+
+## Validation
+
+Correctness checks run:
+
+- `cargo test --test experiment_03`
+- `cargo test compile_keeps_read_batches_free_of_read_read_edges`
+- `cargo test compile_treats_unknown_as_a_strict_barrier`
+
+Benchmark commands run:
+
+- `cargo bench --bench experiment -- experiment/run_parallelism/experiment_03/straggler_partial_overlap`
+- `cargo bench --bench experiment -- experiment/run_parallelism/experiment_03/mixed_hotspots`
+- `cargo bench --bench experiment -- experiment/run_parallelism/experiment_03/layer_barrier_stress`
+- `cargo bench --bench experiment -- experiment/compile/experiment_03/compile_heavy_sparse_keys`
+
+## Measured Outcome
+
+After the change:
+
+- `straggler_partial_overlap`: `784.74 µs .. 869.01 µs`
+- `mixed_hotspots`: `1.511 ms .. 1.538 ms`
+- `layer_barrier_stress`: `562.53 µs .. 565.90 µs`
+- `compile_heavy_sparse_keys`: `20.067 ms .. 20.218 ms`
+
+Observed effect:
+
+- strong repeated-run improvement on all three targeted runtime workloads
+- especially large gains on strict-layer and mixed-hotspot shapes
+- compile cost did not regress; it improved on the measured compile workload
+- `experiment_03` remains a compile-heavy static-DAG executor, but now with a
+  much cheaper ready-job hot path
+
 ## Progress Log
 
 - 2026-04-04: Task created. No implementation yet.
+- 2026-04-05: Benchmarked the existing `experiment_03` implementation and
+  determined that runtime wakeup overhead, not relaxed-edge orientation
+  quality, was the main weakness on the redesigned harness.
+- 2026-04-05: Implemented criticality-ordered roots/successors plus a
+  work-first ready-chain executor in `src/experiment_03/model.rs`.
+- 2026-04-05: Verified the change with targeted tests and benchmarks and marked
+  the task complete.

@@ -82,7 +82,9 @@ Instead it does three things:
    model
 2. it chooses a compile-time priority order for jobs that extends those strict
    constraints
-3. it orients relaxed conflicts according to that priority order and compresses
+3. it computes final-DAG criticality so runtime wakeups can prefer longer
+   remaining paths
+4. it orients relaxed conflicts according to that priority order and compresses
    them into a sparse predecessor/successor DAG
 
 After that, runtime execution is just graph execution.
@@ -124,15 +126,18 @@ That is the central promise of this design:
 At a high level, `experiment_03` executes like this:
 
 1. jobs whose predecessor counter is zero are roots
-2. root jobs are spawned onto the Rayon pool
-3. when a job finishes, it decrements the counters of its direct successors
-4. any successor whose counter reaches zero is spawned immediately
-5. the schedule completes when the DAG drains
+2. roots and successor slices are pre-sorted by final DAG height
+3. one ready chain stays inline on the current worker
+4. when a job finishes, it decrements the counters of its direct successors
+5. the first newly ready successor continues inline and any additional ready
+   successors are spawned immediately
+6. the schedule completes when the DAG drains
 
 That is the entire runtime model.
 
 There are no scheduler-managed reservations, no scan-for-ready passes, and no
-group boundaries.
+group boundaries. The work-first inline chain is there only to reduce ready-job
+spawn overhead; it does not change the compiled DAG semantics.
 
 ## Why This Design May Work Well
 
@@ -151,6 +156,8 @@ That matters because repeated-run throughput is dominated by:
 - one counter per job
 - one flat successor array
 - direct wakeup only
+- critical-path-first wakeup ordering
+- fewer spawned tasks on the hot path
 - no whole-group synchronization
 
 The compile step is intentionally more aggressive if it makes those runtime

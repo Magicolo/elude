@@ -46,17 +46,19 @@ The compilation pipeline is:
 3. build the fixed strict DAG implied by declaration order
 4. reduce those fixed strict edges transitively
 5. choose a global priority order that extends the strict DAG
-6. use that priority order to orient relaxed conflicts
-7. compress the oriented per-key conflict relationships into sparse
+6. compute final-DAG longest-path height for each job
+7. use that priority order to orient relaxed conflicts
+8. compress the oriented per-key conflict relationships into sparse
    predecessor edges
-8. union the fixed strict edges with the oriented relaxed edges
-9. reduce the final DAG transitively
-10. flatten the result into:
+9. union the fixed strict edges with the oriented relaxed edges
+10. reduce the final DAG transitively
+11. order roots and successor slices by final-DAG criticality, then flatten the
+    result into:
     - per-job predecessor counters
     - one flat successor array
     - one root list
 
-Only step 10 matters at runtime.
+Only step 11 matters at runtime.
 
 ## Dependency Semantics
 
@@ -103,6 +105,8 @@ That is all.
 
 There is no scheduler-owned lock table, no page-state array, no group summary
 array, and no runtime conflict scan.
+The only extra runtime shaping is that roots and successor slices are stored in
+criticality order so the executor can stay work-first without searching.
 
 ## Fixed Strict DAG
 
@@ -205,7 +209,9 @@ Execution is a pure topological wakeup engine.
 ### Initialization
 
 - jobs whose predecessor count is zero are roots
-- roots are spawned immediately into the Rayon pool
+- roots are pre-sorted by final-DAG height and priority rank
+- one root starts inline on the current worker
+- any remaining roots are spawned into the Rayon pool
 
 ### Job completion
 
@@ -214,7 +220,8 @@ When a job finishes successfully:
 1. reset its own predecessor counter to its initial value for the next run
 2. walk its direct successor slice
 3. decrement each successor's counter
-4. spawn any successor whose counter reaches zero
+4. continue inline with the first successor whose counter reaches zero
+5. spawn any additional successors whose counters reach zero
 
 ### Error handling
 
@@ -258,6 +265,8 @@ with:
 
 - one atomic counter per job
 - one successor walk on completion
+- no forced spawn for every ready node
+- critical-path-first direct wakeups
 
 If the compile-time orientation is good enough, that simpler runtime may win on
 repeated execution even if it occasionally leaves some parallelism unexploited.
@@ -271,7 +280,7 @@ The implementation relies on these invariants:
 3. the per-key sparse construction preserves all required non-overlap rules
 4. final transitive reduction never removes the last path enforcing a required
    dependency
-5. each job is spawned exactly once per run
+5. each job is activated exactly once per run, either inline or by spawn
 6. predecessor counters are fully restored after each successful run
 
 The shared public API tests exercise those invariants at the behavioral level.
