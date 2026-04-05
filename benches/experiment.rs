@@ -34,8 +34,8 @@ use elude::{
         Order,
         Order::{Relax, Strict},
     },
-    experiment::{CompiledSchedule as _, Job},
-    experiment_01, experiment_02, experiment_03,
+    experiment::{CompiledSchedule as _, Job, Scheduler as _},
+    experiment_01, experiment_02, experiment_03, experiment_04,
 };
 use flecs_ecs::core::{
     Entity as FlecsEntity, IdOperations as _, QueryBuilderImpl as _, SystemAPI as _,
@@ -248,6 +248,150 @@ where
                 |scheduler, (index, spec)| scheduler.add(make_experiment_job(index, spec)),
             )
             .schedule()
+    }
+
+    fn make_state(workload: &Workload) -> Self::State {
+        Arc::new(BenchState::new(workload))
+    }
+
+    fn run(compiled: &mut Self::Compiled, state: &Self::State) -> anyhow::Result<()> {
+        compiled.run(state.as_ref())
+    }
+
+    fn sample(state: &Self::State) -> u64 {
+        state.sample()
+    }
+}
+
+fn compile_experiment_04(
+    workload: &Workload,
+    parallelism: Option<NonZeroUsize>,
+    policy: experiment_04::Policy,
+) -> anyhow::Result<experiment_04::Compiled<BenchState>> {
+    workload
+        .jobs
+        .iter()
+        .enumerate()
+        .fold(
+            experiment_04::Scheduler::with_parallelism_and_policy(parallelism, policy),
+            |scheduler, (index, spec)| scheduler.add(make_experiment_job(index, spec)),
+        )
+        .schedule()
+}
+
+struct Experiment04AdaptiveAdapter;
+
+impl BenchAdapter for Experiment04AdaptiveAdapter {
+    const NAME: &'static str = "experiment_04";
+
+    type State = SharedBenchState;
+    type Compiled = experiment_04::Compiled<BenchState>;
+
+    fn compile(
+        workload: &Workload,
+        parallelism: Option<NonZeroUsize>,
+        _state: &Self::State,
+    ) -> anyhow::Result<Self::Compiled> {
+        compile_experiment_04(workload, parallelism, experiment_04::Policy::Adaptive)
+    }
+
+    fn make_state(workload: &Workload) -> Self::State {
+        Arc::new(BenchState::new(workload))
+    }
+
+    fn run(compiled: &mut Self::Compiled, state: &Self::State) -> anyhow::Result<()> {
+        compiled.run(state.as_ref())
+    }
+
+    fn sample(state: &Self::State) -> u64 {
+        state.sample()
+    }
+}
+
+struct Experiment04CriticalPathAdapter;
+
+impl BenchAdapter for Experiment04CriticalPathAdapter {
+    const NAME: &'static str = "experiment_04_critical_path";
+
+    type State = SharedBenchState;
+    type Compiled = experiment_04::Compiled<BenchState>;
+
+    fn compile(
+        workload: &Workload,
+        parallelism: Option<NonZeroUsize>,
+        _state: &Self::State,
+    ) -> anyhow::Result<Self::Compiled> {
+        compile_experiment_04(
+            workload,
+            parallelism,
+            experiment_04::Policy::Fixed(experiment_04::VariantKind::CriticalPath),
+        )
+    }
+
+    fn make_state(workload: &Workload) -> Self::State {
+        Arc::new(BenchState::new(workload))
+    }
+
+    fn run(compiled: &mut Self::Compiled, state: &Self::State) -> anyhow::Result<()> {
+        compiled.run(state.as_ref())
+    }
+
+    fn sample(state: &Self::State) -> u64 {
+        state.sample()
+    }
+}
+
+struct Experiment04ReadHeavyAdapter;
+
+impl BenchAdapter for Experiment04ReadHeavyAdapter {
+    const NAME: &'static str = "experiment_04_read_heavy";
+
+    type State = SharedBenchState;
+    type Compiled = experiment_04::Compiled<BenchState>;
+
+    fn compile(
+        workload: &Workload,
+        parallelism: Option<NonZeroUsize>,
+        _state: &Self::State,
+    ) -> anyhow::Result<Self::Compiled> {
+        compile_experiment_04(
+            workload,
+            parallelism,
+            experiment_04::Policy::Fixed(experiment_04::VariantKind::ReadHeavy),
+        )
+    }
+
+    fn make_state(workload: &Workload) -> Self::State {
+        Arc::new(BenchState::new(workload))
+    }
+
+    fn run(compiled: &mut Self::Compiled, state: &Self::State) -> anyhow::Result<()> {
+        compiled.run(state.as_ref())
+    }
+
+    fn sample(state: &Self::State) -> u64 {
+        state.sample()
+    }
+}
+
+struct Experiment04HotContentionAdapter;
+
+impl BenchAdapter for Experiment04HotContentionAdapter {
+    const NAME: &'static str = "experiment_04_hot_contention";
+
+    type State = SharedBenchState;
+    type Compiled = experiment_04::Compiled<BenchState>;
+
+    fn compile(
+        workload: &Workload,
+        parallelism: Option<NonZeroUsize>,
+        _state: &Self::State,
+    ) -> anyhow::Result<Self::Compiled> {
+        compile_experiment_04(
+            workload,
+            parallelism,
+            experiment_04::Policy::Fixed(experiment_04::VariantKind::HotContention),
+        )
     }
 
     fn make_state(workload: &Workload) -> Self::State {
@@ -1341,6 +1485,43 @@ fn straggler_partial_overlap(
     )
 }
 
+fn portfolio_bridge_tradeoff(
+    pre_jobs: usize,
+    pre_iterations: u32,
+    bridge_iterations: u32,
+    post_jobs: usize,
+    post_iterations: u32,
+) -> Workload {
+    let mut jobs = Vec::with_capacity(pre_jobs + post_jobs + 1);
+
+    for _ in 0..pre_jobs {
+        jobs.push(JobSpec::new(
+            WorkProfile::busy(pre_iterations),
+            [read_key(20_000, false)],
+        ));
+    }
+
+    jobs.push(JobSpec::new(
+        WorkProfile::busy(bridge_iterations),
+        [write_key(20_000, false), write_key(20_001, false)],
+    ));
+
+    for _ in 0..post_jobs {
+        jobs.push(JobSpec::new(
+            WorkProfile::busy(post_iterations),
+            [read_key(20_001, false)],
+        ));
+    }
+
+    Workload::new(
+        "portfolio_bridge_tradeoff",
+        format!(
+            "pre{pre_jobs}_iter{pre_iterations}_bridge{bridge_iterations}_post{post_jobs}_iter{post_iterations}"
+        ),
+        jobs,
+    )
+}
+
 fn fan_out_fan_in(
     fan_out: usize,
     root_iterations: u32,
@@ -1465,6 +1646,8 @@ fn parallelism_workloads() -> Vec<Workload> {
         hot_key_write_contention(256, WorkProfile::busy(2_000)),
         layer_barrier_stress(128, 400, 5_000, 2_000),
         straggler_partial_overlap(128, 400, 25_000, 1_800),
+        portfolio_bridge_tradeoff(96, 6_000, 400, 32, 1_500),
+        portfolio_bridge_tradeoff(32, 1_500, 400, 96, 6_000),
         fan_out_fan_in(255, 6_000, 1_000, 6_000),
         mixed_hotspots(48),
     ]
@@ -1583,6 +1766,22 @@ fn bench_experiment_03(c: &mut Criterion) {
     bench_adapter::<ExperimentAdapter<experiment_03::Scheduler<BenchState>>>(c);
 }
 
+fn bench_experiment_04(c: &mut Criterion) {
+    bench_adapter::<Experiment04AdaptiveAdapter>(c);
+}
+
+fn bench_experiment_04_critical_path(c: &mut Criterion) {
+    bench_adapter::<Experiment04CriticalPathAdapter>(c);
+}
+
+fn bench_experiment_04_read_heavy(c: &mut Criterion) {
+    bench_adapter::<Experiment04ReadHeavyAdapter>(c);
+}
+
+fn bench_experiment_04_hot_contention(c: &mut Criterion) {
+    bench_adapter::<Experiment04HotContentionAdapter>(c);
+}
+
 fn bench_dagga(c: &mut Criterion) {
     bench_adapter::<DaggaAdapter>(c);
 }
@@ -1612,6 +1811,10 @@ criterion_group!(
     bench_experiment_01,
     bench_experiment_02,
     bench_experiment_03,
+    bench_experiment_04,
+    bench_experiment_04_critical_path,
+    bench_experiment_04_read_heavy,
+    bench_experiment_04_hot_contention,
     bench_dagga,
     bench_dag_exec,
     bench_shipyard,

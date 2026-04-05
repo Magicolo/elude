@@ -1,6 +1,6 @@
 # Task 01: Benchmark Foundation And Workload Redesign
 
-Last updated: 2026-04-04
+Last updated: 2026-04-05
 Status: completed
 Priority: high
 
@@ -49,6 +49,11 @@ The current harness now provides:
   - `BenchAdapter`
 - a generic local adapter:
   - `ExperimentAdapter<T>` for any `experiment::Scheduler<BenchState>`
+- custom local adapters added later during task `06`:
+  - `Experiment04AdaptiveAdapter`
+  - `Experiment04CriticalPathAdapter`
+  - `Experiment04ReadHeavyAdapter`
+  - `Experiment04HotContentionAdapter`
 - external adapters added later during task `05`:
   - `DaggaAdapter`
   - `DagExecAdapter`
@@ -172,12 +177,21 @@ At minimum, the new suite should include the following families.
 - Purpose: combine multiple resources, mixed strict/relax order, and uneven durations.
 - This should resemble the most realistic synthetic case.
 
-9. `fan_out_fan_in`
+9. `portfolio_bridge_tradeoff`
+
+- Purpose: force a real orientation tradeoff between keeping a large read batch
+  ahead of a bridge writer and firing that writer early to unlock a large
+  follower batch.
+- This workload was added during task `06` specifically so `experiment_04`'s
+  fixed variants could be separated by the benchmark suite instead of only by
+  internal tests.
+
+10. `fan_out_fan_in`
 
 - Purpose: stress DAG quality and wakeup efficiency.
 - Useful for `03`, and also for observing whether `01` follower/page scans stay productive.
 
-10. `compile_heavy_sparse_keys`
+11. `compile_heavy_sparse_keys`
 
 - Purpose: stress schedule-time logic on large graphs where runtime work is tiny.
 - This is important because the user explicitly accepts large schedule-time cost.
@@ -258,10 +272,22 @@ Run-parallelism suite:
 - `read_heavy_shared_key`
 - `strict_chain`
 - `hot_key_write_contention`
+- `portfolio_bridge_tradeoff`
 - `layer_barrier_stress`
 - `straggler_partial_overlap`
 - `fan_out_fan_in`
 - `mixed_hotspots`
+
+## Post-Task Extensions
+
+The original task `01` delivered the shared IR and adapter abstraction. Later
+tasks extended that foundation in two important ways:
+
+- task `05` added external adapters for `dagga`, `dag_exec`, `shipyard`,
+  `legion`, `bevy_ecs`, and `flecs`
+- task `06` added benchmark-visible fixed-policy adapters for `experiment_04`
+  and introduced the `portfolio_bridge_tradeoff` family to expose schedule
+  shape differences directly
 
 Important shapes:
 
