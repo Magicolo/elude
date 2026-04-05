@@ -11,8 +11,17 @@ rayon = "*"
 anyhow = "*"
 
 [dev-dependencies]
+bevy_ecs = { version = "0.18.1", default-features = false, features = ["std", "multi_threaded"] }
+bevy_tasks = { version = "0.18.1", default-features = false, features = ["multi_threaded"] }
+bevy_utils = { version = "0.18.1", default-features = false, features = ["std"] }
 checkito = "*"
 criterion = { version = "0.5", features = ["html_reports"] }
+dag_exec = "0.1.1"
+dagga = "0.2.3"
+flecs_ecs = "0.2.2"
+legion = { version = "0.4.0", default-features = false, features = ["parallel"] }
+seq-macro = "0.3.6"
+shipyard = { version = "0.11.2", default-features = false, features = ["std", "parallel"] }
 
 [[bench]]
 name = "experiment"

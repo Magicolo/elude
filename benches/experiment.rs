@@ -1,24 +1,82 @@
+use bevy_ecs::{
+    change_detection::{CheckChangeTicks, Tick},
+    component::{
+        ComponentCloneBehavior as BevyComponentCloneBehavior,
+        ComponentDescriptor as BevyComponentDescriptor, StorageType as BevyStorageType,
+    },
+    query::FilteredAccessSet as BevyFilteredAccessSet,
+    schedule::{IntoScheduleConfigs as _, Schedule as BevySchedule, SystemSet as BevySystemSet},
+    system::{
+        BoxedSystem as BevyBoxedSystem, RunSystemError as BevyRunSystemError, System as BevySystem,
+        SystemParamValidationError as BevySystemParamValidationError,
+        SystemStateFlags as BevySystemStateFlags,
+    },
+    world::{
+        unsafe_world_cell::UnsafeWorldCell as BevyUnsafeWorldCell,
+        DeferredWorld as BevyDeferredWorld, World as BevyWorld,
+    },
+};
+use bevy_tasks::{ComputeTaskPool, TaskPool, TaskPoolBuilder as BevyTaskPoolBuilder};
+use bevy_utils::prelude::DebugName as BevyDebugName;
 use criterion::{
     black_box, criterion_group, criterion_main, BenchmarkId, Criterion, SamplingMode, Throughput,
 };
+use dag_exec::{
+    DagBuilder as ExplicitDagBuilder, Executor as DagExecutor, ExecutorConfig as DagExecutorConfig,
+};
+use dagga::{Dag as DaggaGraph, Node as DaggaNode, Schedule as DaggaSchedule};
 use elude::{
     depend::{
         Dependency,
         Dependency::{Read, Write},
+        Key,
         Key::Identifier,
+        Order,
         Order::{Relax, Strict},
     },
     experiment::{CompiledSchedule as _, Job},
-    experiment_01,
-    experiment_02,
-    experiment_03,
+    experiment_01, experiment_02, experiment_03,
+};
+use flecs_ecs::core::{
+    Entity as FlecsEntity, IdOperations as _, QueryBuilderImpl as _, SystemAPI as _,
+    TermBuilderImpl as _, World as FlecsWorld,
+};
+use legion::{
+    storage::ComponentTypeId as LegionComponentTypeId,
+    systems::{
+        CommandBuffer as LegionCommandBuffer, Executor as LegionExecutor,
+        ParallelRunnable as LegionParallelRunnable, ResourceTypeId as LegionResourceTypeId,
+        Resources as LegionResources, Runnable as LegionRunnable,
+        UnsafeResources as LegionUnsafeResources,
+    },
+    world::{ArchetypeAccess as LegionArchetypeAccess, WorldId as LegionWorldId},
+    World as LegionWorld,
+};
+use rayon::{prelude::*, ThreadPool, ThreadPoolBuilder};
+use seq_macro::seq;
+use shipyard::{
+    advanced::StorageId as ShipyardStorageId,
+    borrow::Mutability as ShipyardMutability,
+    error::Run as ShipyardRunError,
+    scheduler::{info::TypeInfo as ShipyardTypeInfo, WorkloadSystem as ShipyardWorkloadSystem},
+    Workload as ShipyardWorkload, World as ShipyardWorld,
 };
 use std::{
+    alloc::Layout,
+    any::TypeId,
+    collections::{BTreeMap, HashMap},
+    convert::Infallible,
     num::NonZeroUsize,
-    sync::atomic::{AtomicU64, Ordering::Relaxed as AtomicRelaxed},
+    sync::{
+        atomic::{AtomicU64, Ordering::Relaxed as AtomicRelaxed},
+        Arc,
+    },
     thread,
     time::Duration,
 };
+
+const SHIPYARD_MAX_BENCH_JOBS: usize = 4096;
+const LEGION_MAX_BENCH_RESOURCE_IDS: usize = 6144;
 
 #[derive(Clone, Copy, Debug)]
 struct WorkProfile {
@@ -53,12 +111,12 @@ struct JobSpec {
 }
 
 impl JobSpec {
-    fn new(
-        work: WorkProfile,
-        dependencies: impl IntoIterator<Item = Dependency>,
-    ) -> Self {
+    fn new(work: WorkProfile, dependencies: impl IntoIterator<Item = Dependency>) -> Self {
         Self {
-            dependencies: dependencies.into_iter().collect::<Vec<_>>().into_boxed_slice(),
+            dependencies: dependencies
+                .into_iter()
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
             predecessors: Vec::new().into_boxed_slice(),
             weight_hint: work.iterations(),
             work,
@@ -102,6 +160,8 @@ struct BenchState {
     slots: Box<[AtomicU64]>,
 }
 
+type SharedBenchState = Arc<BenchState>;
+
 impl BenchState {
     fn new(workload: &Workload) -> Self {
         Self {
@@ -123,9 +183,9 @@ impl BenchState {
     }
 }
 
-fn execute_work(work: WorkProfile, state: &BenchState, job_index: usize) {
+fn compute_work_value(work: WorkProfile, job_index: usize, seed: u64) -> u64 {
     let mut value =
-        (job_index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0xa5a5_a5a5_a5a5_a5a5;
+        seed ^ (job_index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0xa5a5_a5a5_a5a5_a5a5;
 
     for step in 0..work.iterations() {
         value = value
@@ -135,7 +195,13 @@ fn execute_work(work: WorkProfile, state: &BenchState, job_index: usize) {
         std::hint::spin_loop();
     }
 
+    value
+}
+
+fn execute_work(work: WorkProfile, state: &BenchState, job_index: usize, seed: u64) -> u64 {
+    let value = compute_work_value(work, job_index, seed);
     state.record(job_index, value);
+    value
 }
 
 trait BenchAdapter {
@@ -147,6 +213,7 @@ trait BenchAdapter {
     fn compile(
         workload: &Workload,
         parallelism: Option<NonZeroUsize>,
+        state: &Self::State,
     ) -> anyhow::Result<Self::Compiled>;
 
     fn make_state(workload: &Workload) -> Self::State;
@@ -164,29 +231,31 @@ where
 {
     const NAME: &'static str = T::NAME;
 
-    type State = BenchState;
+    type State = SharedBenchState;
     type Compiled = T::Schedule;
 
     fn compile(
         workload: &Workload,
         parallelism: Option<NonZeroUsize>,
+        _state: &Self::State,
     ) -> anyhow::Result<Self::Compiled> {
         workload
             .jobs
             .iter()
             .enumerate()
-            .fold(T::with_parallelism(parallelism), |scheduler, (index, spec)| {
-                scheduler.add(make_experiment_job(index, spec))
-            })
+            .fold(
+                T::with_parallelism(parallelism),
+                |scheduler, (index, spec)| scheduler.add(make_experiment_job(index, spec)),
+            )
             .schedule()
     }
 
     fn make_state(workload: &Workload) -> Self::State {
-        BenchState::new(workload)
+        Arc::new(BenchState::new(workload))
     }
 
     fn run(compiled: &mut Self::Compiled, state: &Self::State) -> anyhow::Result<()> {
-        compiled.run(state)
+        compiled.run(state.as_ref())
     }
 
     fn sample(state: &Self::State) -> u64 {
@@ -200,10 +269,942 @@ fn make_experiment_job(index: usize, spec: &JobSpec) -> Job<BenchState> {
     let work = spec.work;
 
     Job::new(move |state: &BenchState| {
-        execute_work(work, state, index);
+        execute_work(work, state, index, 0);
         Ok(())
     })
     .depend(spec.dependencies.iter().cloned())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AccessSpec {
+    resource: u64,
+    write: bool,
+    order: Order,
+}
+
+#[derive(Clone, Debug)]
+struct NormalizedJob {
+    name: String,
+    accesses: Box<[AccessSpec]>,
+    predecessors: Box<[usize]>,
+    work: WorkProfile,
+    weight_hint: u32,
+    unknown: bool,
+}
+
+#[derive(Clone, Debug)]
+struct NormalizedWorkload {
+    jobs: Box<[NormalizedJob]>,
+    dagga_predecessors: Box<[Box<[usize]>]>,
+    explicit_dag_predecessors: Box<[Box<[usize]>]>,
+}
+
+fn normalize_workload(workload: &Workload) -> NormalizedWorkload {
+    let mut resource_ids = HashMap::<Key, u64>::new();
+    let mut next_resource = 1u64;
+
+    let jobs = workload
+        .jobs
+        .iter()
+        .enumerate()
+        .map(|(index, spec)| {
+            let mut accesses = BTreeMap::<u64, AccessSpec>::new();
+            let mut unknown = false;
+
+            for dependency in spec.dependencies.iter() {
+                match dependency {
+                    Dependency::Unknown => unknown = true,
+                    Read(key, order) | Write(key, order) => {
+                        let is_write = matches!(dependency, Write(_, _));
+                        let resource = *resource_ids.entry(key.clone()).or_insert_with(|| {
+                            let assigned = next_resource;
+                            next_resource += 1;
+                            assigned
+                        });
+
+                        accesses
+                            .entry(resource)
+                            .and_modify(|access| {
+                                access.write |= is_write;
+                                access.order = access.order.max(*order);
+                            })
+                            .or_insert(AccessSpec {
+                                resource,
+                                write: is_write,
+                                order: *order,
+                            });
+                    }
+                }
+            }
+
+            NormalizedJob {
+                name: format!("job{index}"),
+                accesses: accesses
+                    .into_values()
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+                predecessors: spec.predecessors.clone(),
+                work: spec.work,
+                weight_hint: spec.weight_hint,
+                unknown,
+            }
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+
+    let dagga_predecessors = build_predecessors(&jobs, true);
+    let explicit_dag_predecessors = build_predecessors(&jobs, false);
+
+    NormalizedWorkload {
+        jobs,
+        dagga_predecessors,
+        explicit_dag_predecessors,
+    }
+}
+
+fn build_predecessors(
+    jobs: &[NormalizedJob],
+    preserve_relaxed_parallelism: bool,
+) -> Box<[Box<[usize]>]> {
+    let mut predecessors = jobs
+        .iter()
+        .map(|job| job.predecessors.iter().copied().collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+
+    for barrier in 0..jobs.len() {
+        if !jobs[barrier].unknown {
+            continue;
+        }
+
+        for predecessor in 0..barrier {
+            predecessors[barrier].push(predecessor);
+        }
+        for follower in barrier + 1..jobs.len() {
+            predecessors[follower].push(barrier);
+        }
+    }
+
+    for right in 0..jobs.len() {
+        for left in 0..right {
+            let needs_edge = if preserve_relaxed_parallelism {
+                needs_strict_order(&jobs[left], &jobs[right])
+            } else {
+                jobs_conflict(&jobs[left], &jobs[right])
+            };
+
+            if needs_edge {
+                predecessors[right].push(left);
+            }
+        }
+    }
+
+    predecessors
+        .into_iter()
+        .map(|mut job_predecessors| {
+            job_predecessors.sort_unstable();
+            job_predecessors.dedup();
+            job_predecessors.into_boxed_slice()
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+}
+
+fn needs_strict_order(left: &NormalizedJob, right: &NormalizedJob) -> bool {
+    if left.unknown || right.unknown {
+        return false;
+    }
+
+    let mut left_index = 0usize;
+    let mut right_index = 0usize;
+
+    while let (Some(left_access), Some(right_access)) = (
+        left.accesses.get(left_index),
+        right.accesses.get(right_index),
+    ) {
+        match left_access.resource.cmp(&right_access.resource) {
+            std::cmp::Ordering::Less => left_index += 1,
+            std::cmp::Ordering::Greater => right_index += 1,
+            std::cmp::Ordering::Equal => {
+                if (left_access.write || right_access.write)
+                    && left_access.order.max(right_access.order) == Strict
+                {
+                    return true;
+                }
+                left_index += 1;
+                right_index += 1;
+            }
+        }
+    }
+
+    false
+}
+
+fn jobs_conflict(left: &NormalizedJob, right: &NormalizedJob) -> bool {
+    if left.unknown || right.unknown {
+        return true;
+    }
+
+    let mut left_index = 0usize;
+    let mut right_index = 0usize;
+
+    while let (Some(left_access), Some(right_access)) = (
+        left.accesses.get(left_index),
+        right.accesses.get(right_index),
+    ) {
+        match left_access.resource.cmp(&right_access.resource) {
+            std::cmp::Ordering::Less => left_index += 1,
+            std::cmp::Ordering::Greater => right_index += 1,
+            std::cmp::Ordering::Equal => {
+                if left_access.write || right_access.write {
+                    return true;
+                }
+                left_index += 1;
+                right_index += 1;
+            }
+        }
+    }
+
+    false
+}
+
+struct ShipyardJobMarker<const N: usize>;
+
+fn shipyard_job_type_id(index: usize) -> TypeId {
+    if index >= SHIPYARD_MAX_BENCH_JOBS {
+        panic!("shipyard adapter supports at most {SHIPYARD_MAX_BENCH_JOBS} jobs, got {index}");
+    }
+
+    seq!(N in 0..4096 {
+        match index {
+            #(N => TypeId::of::<ShipyardJobMarker<N>>(),)*
+            _ => unreachable!("shipyard job index is bounds-checked above"),
+        }
+    })
+}
+
+struct LegionResourceMarker<const N: usize>;
+
+fn legion_resource_type_id(index: usize) -> LegionResourceTypeId {
+    if index >= LEGION_MAX_BENCH_RESOURCE_IDS {
+        panic!(
+            "legion adapter supports at most {LEGION_MAX_BENCH_RESOURCE_IDS} resource ids, got {index}"
+        );
+    }
+
+    seq!(N in 0..6144 {
+        match index {
+            #(N => LegionResourceTypeId::of::<LegionResourceMarker<N>>(),)*
+            _ => unreachable!("legion resource index is bounds-checked above"),
+        }
+    })
+}
+
+fn normalized_resource_count(normalized: &NormalizedWorkload) -> usize {
+    normalized
+        .jobs
+        .iter()
+        .flat_map(|job| job.accesses.iter().map(|access| access.resource as usize))
+        .max()
+        .unwrap_or(0)
+}
+
+fn init_bevy_task_pool(parallelism: Option<NonZeroUsize>) {
+    let workers = worker_count(parallelism);
+    let _ = ComputeTaskPool::get_or_init(|| {
+        if workers <= 1 {
+            TaskPool::new()
+        } else {
+            BevyTaskPoolBuilder::new().num_threads(workers).build()
+        }
+    });
+}
+
+fn bevy_resource_descriptor(resource: u64) -> BevyComponentDescriptor {
+    // The benchmark only needs scheduler-visible resource identities.
+    unsafe {
+        BevyComponentDescriptor::new_with_layout(
+            format!("bench_resource_{resource}"),
+            BevyStorageType::Table,
+            Layout::new::<()>(),
+            None,
+            true,
+            BevyComponentCloneBehavior::Default,
+            None,
+        )
+    }
+}
+
+fn worker_count(parallelism: Option<NonZeroUsize>) -> usize {
+    parallelism
+        .map(NonZeroUsize::get)
+        .or_else(|| thread::available_parallelism().ok().map(NonZeroUsize::get))
+        .unwrap_or(1)
+        .max(1)
+}
+
+fn build_thread_pool(parallelism: Option<NonZeroUsize>) -> anyhow::Result<Option<ThreadPool>> {
+    let workers = worker_count(parallelism);
+    if workers <= 1 {
+        Ok(None)
+    } else {
+        Ok(Some(ThreadPoolBuilder::new().num_threads(workers).build()?))
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DaggaJob {
+    index: usize,
+    work: WorkProfile,
+}
+
+struct DaggaCompiled {
+    schedule: DaggaSchedule<DaggaNode<DaggaJob, u64>>,
+    pool: Option<ThreadPool>,
+}
+
+struct DaggaAdapter;
+
+impl BenchAdapter for DaggaAdapter {
+    const NAME: &'static str = "dagga";
+
+    type State = SharedBenchState;
+    type Compiled = DaggaCompiled;
+
+    fn compile(
+        workload: &Workload,
+        parallelism: Option<NonZeroUsize>,
+        _state: &Self::State,
+    ) -> anyhow::Result<Self::Compiled> {
+        let normalized = normalize_workload(workload);
+        let mut dag = DaggaGraph::default();
+
+        for (index, job) in normalized.jobs.iter().enumerate() {
+            debug_assert_eq!(job.weight_hint, job.work.iterations());
+            let mut node = DaggaNode::new(DaggaJob {
+                index,
+                work: job.work,
+            })
+            .with_name(job.name.clone());
+
+            if !job.unknown {
+                node = node.with_reads(
+                    job.accesses
+                        .iter()
+                        .filter(|access| !access.write)
+                        .map(|access| access.resource),
+                );
+                node = node.with_writes(
+                    job.accesses
+                        .iter()
+                        .filter(|access| access.write)
+                        .map(|access| access.resource),
+                );
+            }
+
+            for &predecessor in normalized.dagga_predecessors[index].iter() {
+                node = node.run_after(normalized.jobs[predecessor].name.clone());
+            }
+
+            dag.add_node(node);
+        }
+
+        let schedule = dag
+            .build_schedule()
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+
+        Ok(DaggaCompiled {
+            schedule,
+            pool: build_thread_pool(parallelism)?,
+        })
+    }
+
+    fn make_state(workload: &Workload) -> Self::State {
+        Arc::new(BenchState::new(workload))
+    }
+
+    fn run(compiled: &mut Self::Compiled, state: &Self::State) -> anyhow::Result<()> {
+        for batch in compiled.schedule.batches.iter() {
+            if let Some(pool) = &compiled.pool {
+                if batch.len() > 1 {
+                    pool.install(|| {
+                        batch.par_iter().for_each(|node| {
+                            let job = node.inner();
+                            execute_work(job.work, state.as_ref(), job.index, 0);
+                        });
+                    });
+                    continue;
+                }
+            }
+
+            for node in batch.iter() {
+                let job = node.inner();
+                execute_work(job.work, state.as_ref(), job.index, 0);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn sample(state: &Self::State) -> u64 {
+        state.sample()
+    }
+}
+
+struct DagExecCompiled {
+    dag: dag_exec::Dag<usize, u64, Infallible>,
+    executor: DagExecutor,
+    outputs: Box<[usize]>,
+}
+
+struct DagExecAdapter;
+
+impl BenchAdapter for DagExecAdapter {
+    const NAME: &'static str = "dag_exec";
+
+    type State = SharedBenchState;
+    type Compiled = DagExecCompiled;
+
+    fn compile(
+        workload: &Workload,
+        parallelism: Option<NonZeroUsize>,
+        state: &Self::State,
+    ) -> anyhow::Result<Self::Compiled> {
+        let normalized = normalize_workload(workload);
+        let mut builder = ExplicitDagBuilder::<usize, u64, Infallible>::new();
+
+        for (index, job) in normalized.jobs.iter().enumerate() {
+            debug_assert_eq!(job.weight_hint, job.work.iterations());
+            let work = job.work;
+            let state = Arc::clone(state);
+            let predecessors = normalized.explicit_dag_predecessors[index].to_vec();
+
+            builder
+                .add_task(index, predecessors, move |inputs| {
+                    let seed = inputs.iter().fold(index as u64, |acc, value| {
+                        acc ^ (**value).rotate_left(((acc as u32) & 31) + 1)
+                    });
+                    let value = execute_work(work, state.as_ref(), index, seed);
+                    Ok(value)
+                })
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+        }
+
+        let workers = worker_count(parallelism);
+        let dag = builder
+            .build()
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let outputs = (0..normalized.jobs.len())
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+
+        Ok(DagExecCompiled {
+            dag,
+            executor: DagExecutor::new(DagExecutorConfig {
+                max_workers: workers,
+                max_in_flight: workers.saturating_mul(2).max(1),
+                worker_queue_cap: 2,
+            }),
+            outputs,
+        })
+    }
+
+    fn make_state(workload: &Workload) -> Self::State {
+        Arc::new(BenchState::new(workload))
+    }
+
+    fn run(compiled: &mut Self::Compiled, state: &Self::State) -> anyhow::Result<()> {
+        compiled
+            .executor
+            .run_parallel(&compiled.dag, compiled.outputs.iter().copied())
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        black_box(state.sample());
+        Ok(())
+    }
+
+    fn sample(state: &Self::State) -> u64 {
+        state.sample()
+    }
+}
+
+struct ShipyardCompiled {
+    workload: shipyard::scheduler::ScheduledWorkload,
+    world: ShipyardWorld,
+}
+
+struct ShipyardAdapter;
+
+impl BenchAdapter for ShipyardAdapter {
+    const NAME: &'static str = "shipyard";
+
+    type State = SharedBenchState;
+    type Compiled = ShipyardCompiled;
+
+    fn compile(
+        workload: &Workload,
+        parallelism: Option<NonZeroUsize>,
+        state: &Self::State,
+    ) -> anyhow::Result<Self::Compiled> {
+        let normalized = normalize_workload(workload);
+        anyhow::ensure!(
+            normalized.jobs.len() <= SHIPYARD_MAX_BENCH_JOBS,
+            "shipyard adapter supports at most {SHIPYARD_MAX_BENCH_JOBS} jobs, got {}",
+            normalized.jobs.len()
+        );
+
+        let mut workload_builder = ShipyardWorkload::new("benchmark");
+
+        for (index, job) in normalized.jobs.iter().enumerate() {
+            debug_assert_eq!(job.weight_hint, job.work.iterations());
+            let state = Arc::clone(state);
+            let work = job.work;
+            let type_id = shipyard_job_type_id(index);
+            let system = ShipyardWorkloadSystem {
+                type_id,
+                display_name: Box::new(job.name.clone()),
+                system_fn: Box::new(move |_world| -> Result<(), ShipyardRunError> {
+                    execute_work(work, state.as_ref(), index, 0);
+                    Ok(())
+                }),
+                borrow_constraints: job
+                    .accesses
+                    .iter()
+                    .map(|access| ShipyardTypeInfo {
+                        name: format!("resource{}", access.resource).into(),
+                        mutability: if access.write {
+                            ShipyardMutability::Exclusive
+                        } else {
+                            ShipyardMutability::Shared
+                        },
+                        storage_id: ShipyardStorageId::Custom(access.resource),
+                        thread_safe: true,
+                    })
+                    .collect(),
+                tracking_to_enable: Vec::new(),
+                generator: Box::new(move |_| type_id),
+                run_if: None,
+                tags: Vec::new(),
+                before_all: Default::default(),
+                after_all: Default::default(),
+                after: normalized.dagga_predecessors[index].to_vec(),
+                before: Vec::new(),
+                unique_id: 0,
+                require_in_workload: Default::default(),
+                require_before: Default::default(),
+                require_after: Default::default(),
+            };
+
+            workload_builder = workload_builder.with_system(system);
+        }
+
+        let world = match build_thread_pool(parallelism)? {
+            Some(pool) => ShipyardWorld::builder()
+                .with_local_thread_pool(pool)
+                .build(),
+            None => ShipyardWorld::builder().build(),
+        };
+        let (workload, _) = workload_builder
+            .build()
+            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+
+        Ok(ShipyardCompiled { workload, world })
+    }
+
+    fn make_state(workload: &Workload) -> Self::State {
+        Arc::new(BenchState::new(workload))
+    }
+
+    fn run(compiled: &mut Self::Compiled, _state: &Self::State) -> anyhow::Result<()> {
+        compiled
+            .workload
+            .run_with_world(&compiled.world)
+            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+        Ok(())
+    }
+
+    fn sample(state: &Self::State) -> u64 {
+        state.sample()
+    }
+}
+
+struct LegionRunnableJob {
+    name: String,
+    read_resources: Box<[LegionResourceTypeId]>,
+    write_resources: Box<[LegionResourceTypeId]>,
+    archetypes: LegionArchetypeAccess,
+    work: WorkProfile,
+    state: SharedBenchState,
+    index: usize,
+}
+
+impl LegionRunnable for LegionRunnableJob {
+    fn name(&self) -> Option<&legion::systems::SystemId> {
+        let _ = &self.name;
+        None
+    }
+
+    fn reads(&self) -> (&[LegionResourceTypeId], &[LegionComponentTypeId]) {
+        static NO_COMPONENTS: [LegionComponentTypeId; 0] = [];
+        (&self.read_resources, &NO_COMPONENTS)
+    }
+
+    fn writes(&self) -> (&[LegionResourceTypeId], &[LegionComponentTypeId]) {
+        static NO_COMPONENTS: [LegionComponentTypeId; 0] = [];
+        (&self.write_resources, &NO_COMPONENTS)
+    }
+
+    fn prepare(&mut self, _world: &LegionWorld) {}
+
+    fn accesses_archetypes(&self) -> &LegionArchetypeAccess {
+        &self.archetypes
+    }
+
+    unsafe fn run_unsafe(&mut self, _world: &LegionWorld, _resources: &LegionUnsafeResources) {
+        execute_work(self.work, self.state.as_ref(), self.index, 0);
+    }
+
+    fn command_buffer_mut(&mut self, _world: LegionWorldId) -> Option<&mut LegionCommandBuffer> {
+        None
+    }
+}
+
+struct LegionCompiled {
+    executor: LegionExecutor,
+    world: LegionWorld,
+    resources: LegionResources,
+    pool: Option<ThreadPool>,
+}
+
+struct LegionPoolRunPtrs {
+    executor: *mut LegionExecutor,
+    world: *mut LegionWorld,
+    resources: *mut LegionResources,
+}
+
+unsafe impl Send for LegionPoolRunPtrs {}
+
+impl LegionPoolRunPtrs {
+    unsafe fn execute(self) {
+        (*self.executor).execute(&mut *self.world, &mut *self.resources);
+    }
+}
+
+struct LegionAdapter;
+
+impl BenchAdapter for LegionAdapter {
+    const NAME: &'static str = "legion";
+
+    type State = SharedBenchState;
+    type Compiled = LegionCompiled;
+
+    fn compile(
+        workload: &Workload,
+        parallelism: Option<NonZeroUsize>,
+        state: &Self::State,
+    ) -> anyhow::Result<Self::Compiled> {
+        let normalized = normalize_workload(workload);
+        let resource_count = normalized_resource_count(&normalized);
+        let order_token_base = resource_count + 1;
+        let required_ids = order_token_base + normalized.jobs.len();
+        anyhow::ensure!(
+            required_ids <= LEGION_MAX_BENCH_RESOURCE_IDS,
+            "legion adapter supports at most {LEGION_MAX_BENCH_RESOURCE_IDS} resource ids, needs {required_ids}"
+        );
+
+        let mut systems =
+            Vec::<Box<dyn LegionParallelRunnable>>::with_capacity(normalized.jobs.len());
+
+        for (index, job) in normalized.jobs.iter().enumerate() {
+            debug_assert_eq!(job.weight_hint, job.work.iterations());
+            let mut read_resources = job
+                .accesses
+                .iter()
+                .filter(|access| !access.write)
+                .map(|access| legion_resource_type_id(access.resource as usize))
+                .collect::<Vec<_>>();
+            let mut write_resources = job
+                .accesses
+                .iter()
+                .filter(|access| access.write)
+                .map(|access| legion_resource_type_id(access.resource as usize))
+                .collect::<Vec<_>>();
+
+            for &predecessor in normalized.dagga_predecessors[index].iter() {
+                read_resources.push(legion_resource_type_id(order_token_base + predecessor));
+            }
+
+            write_resources.push(legion_resource_type_id(order_token_base + index));
+
+            systems.push(Box::new(LegionRunnableJob {
+                name: job.name.clone(),
+                read_resources: read_resources.into_boxed_slice(),
+                write_resources: write_resources.into_boxed_slice(),
+                archetypes: LegionArchetypeAccess::Some(Default::default()),
+                work: job.work,
+                state: Arc::clone(state),
+                index,
+            }));
+        }
+
+        Ok(LegionCompiled {
+            executor: LegionExecutor::new(systems),
+            world: LegionWorld::default(),
+            resources: LegionResources::default(),
+            pool: build_thread_pool(parallelism)?,
+        })
+    }
+
+    fn make_state(workload: &Workload) -> Self::State {
+        Arc::new(BenchState::new(workload))
+    }
+
+    fn run(compiled: &mut Self::Compiled, _state: &Self::State) -> anyhow::Result<()> {
+        if let Some(pool) = &compiled.pool {
+            let ptrs = LegionPoolRunPtrs {
+                executor: &mut compiled.executor,
+                world: &mut compiled.world,
+                resources: &mut compiled.resources,
+            };
+            pool.install(move || unsafe {
+                ptrs.execute();
+            });
+        } else {
+            compiled
+                .executor
+                .execute(&mut compiled.world, &mut compiled.resources);
+        }
+        Ok(())
+    }
+
+    fn sample(state: &Self::State) -> u64 {
+        state.sample()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct DynamicBevySet(usize);
+
+impl BevySystemSet for DynamicBevySet {
+    fn dyn_clone(&self) -> Box<dyn BevySystemSet> {
+        Box::new(*self)
+    }
+}
+
+struct BevyDynamicSystem {
+    name: String,
+    access: BevyFilteredAccessSet,
+    work: WorkProfile,
+    state: SharedBenchState,
+    index: usize,
+    last_run: Tick,
+}
+
+impl BevySystem for BevyDynamicSystem {
+    type In = ();
+    type Out = ();
+
+    fn name(&self) -> BevyDebugName {
+        self.name.clone().into()
+    }
+
+    fn flags(&self) -> BevySystemStateFlags {
+        BevySystemStateFlags::empty()
+    }
+
+    unsafe fn run_unsafe(
+        &mut self,
+        _input: (),
+        _world: BevyUnsafeWorldCell,
+    ) -> Result<(), BevyRunSystemError> {
+        execute_work(self.work, self.state.as_ref(), self.index, 0);
+        Ok(())
+    }
+
+    fn apply_deferred(&mut self, _world: &mut BevyWorld) {}
+
+    fn queue_deferred(&mut self, _world: BevyDeferredWorld) {}
+
+    unsafe fn validate_param_unsafe(
+        &mut self,
+        _world: BevyUnsafeWorldCell,
+    ) -> Result<(), BevySystemParamValidationError> {
+        Ok(())
+    }
+
+    fn initialize(&mut self, _world: &mut BevyWorld) -> BevyFilteredAccessSet {
+        self.access.clone()
+    }
+
+    fn check_change_tick(&mut self, check: CheckChangeTicks) {
+        let _ = self.last_run.check_tick(check);
+    }
+
+    fn get_last_run(&self) -> Tick {
+        self.last_run
+    }
+
+    fn set_last_run(&mut self, last_run: Tick) {
+        self.last_run = last_run;
+    }
+}
+
+struct BevyCompiled {
+    schedule: BevySchedule,
+    world: BevyWorld,
+}
+
+struct BevyAdapter;
+
+impl BenchAdapter for BevyAdapter {
+    const NAME: &'static str = "bevy_ecs";
+
+    type State = SharedBenchState;
+    type Compiled = BevyCompiled;
+
+    fn compile(
+        workload: &Workload,
+        parallelism: Option<NonZeroUsize>,
+        state: &Self::State,
+    ) -> anyhow::Result<Self::Compiled> {
+        init_bevy_task_pool(parallelism);
+        let normalized = normalize_workload(workload);
+        let mut world = BevyWorld::new();
+        let resource_count = normalized_resource_count(&normalized);
+        let mut resource_ids = vec![None; resource_count + 1];
+
+        for resource in 1..=resource_count {
+            resource_ids[resource] = Some(
+                world.register_resource_with_descriptor(bevy_resource_descriptor(resource as u64)),
+            );
+        }
+
+        let mut schedule = BevySchedule::default();
+
+        for (index, job) in normalized.jobs.iter().enumerate() {
+            debug_assert_eq!(job.weight_hint, job.work.iterations());
+            let mut access = BevyFilteredAccessSet::new();
+            for entry in job.accesses.iter() {
+                let component_id = resource_ids[entry.resource as usize]
+                    .expect("every normalized bevy resource is registered");
+                if entry.write {
+                    access.add_unfiltered_resource_write(component_id);
+                } else {
+                    access.add_unfiltered_resource_read(component_id);
+                }
+            }
+
+            let system: BevyBoxedSystem<(), ()> = Box::new(BevyDynamicSystem {
+                name: job.name.clone(),
+                access,
+                work: job.work,
+                state: Arc::clone(state),
+                index,
+                last_run: Tick::new(0),
+            });
+
+            let mut config = system.in_set(DynamicBevySet(index));
+            for &predecessor in normalized.dagga_predecessors[index].iter() {
+                config = config.after(DynamicBevySet(predecessor));
+            }
+            schedule.add_systems(config);
+        }
+
+        schedule
+            .initialize(&mut world)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+
+        Ok(BevyCompiled { schedule, world })
+    }
+
+    fn make_state(workload: &Workload) -> Self::State {
+        Arc::new(BenchState::new(workload))
+    }
+
+    fn run(compiled: &mut Self::Compiled, _state: &Self::State) -> anyhow::Result<()> {
+        compiled.schedule.run(&mut compiled.world);
+        Ok(())
+    }
+
+    fn sample(state: &Self::State) -> u64 {
+        state.sample()
+    }
+}
+
+struct FlecsCompiled {
+    world: FlecsWorld,
+}
+
+struct FlecsAdapter;
+
+impl BenchAdapter for FlecsAdapter {
+    const NAME: &'static str = "flecs";
+
+    type State = SharedBenchState;
+    type Compiled = FlecsCompiled;
+
+    fn compile(
+        workload: &Workload,
+        parallelism: Option<NonZeroUsize>,
+        state: &Self::State,
+    ) -> anyhow::Result<Self::Compiled> {
+        let normalized = normalize_workload(workload);
+        let world = FlecsWorld::new();
+        world.set_threads(worker_count(parallelism) as i32);
+
+        let resource_count = normalized_resource_count(&normalized);
+        let mut resource_entities = vec![None; resource_count + 1];
+        let mut system_entities = Vec::<FlecsEntity>::with_capacity(normalized.jobs.len());
+
+        for resource in 1..=resource_count {
+            resource_entities[resource] = Some(FlecsEntity(
+                *world
+                    .entity_named(&format!("bench_resource_{resource}"))
+                    .id(),
+            ));
+        }
+
+        for (index, job) in normalized.jobs.iter().enumerate() {
+            debug_assert_eq!(job.weight_hint, job.work.iterations());
+            let mut builder = world.system_named::<()>(&job.name);
+
+            for access in job.accesses.iter() {
+                let resource = resource_entities[access.resource as usize]
+                    .expect("every normalized flecs resource is registered");
+                builder.term().set_id(resource);
+                if access.write {
+                    builder.write_curr();
+                } else {
+                    builder.read_curr();
+                }
+            }
+
+            let state = Arc::clone(state);
+            let work = job.work;
+            let system = builder.run(move |_iter| {
+                execute_work(work, state.as_ref(), index, 0);
+            });
+
+            for &predecessor in normalized.dagga_predecessors[index].iter() {
+                system.depends_on(system_entities[predecessor]);
+            }
+
+            system_entities.push(FlecsEntity(*system.id()));
+        }
+
+        Ok(FlecsCompiled { world })
+    }
+
+    fn make_state(workload: &Workload) -> Self::State {
+        Arc::new(BenchState::new(workload))
+    }
+
+    fn run(compiled: &mut Self::Compiled, _state: &Self::State) -> anyhow::Result<()> {
+        compiled.world.progress();
+        Ok(())
+    }
+
+    fn sample(state: &Self::State) -> u64 {
+        state.sample()
+    }
 }
 
 fn write_key(key: usize, strict: bool) -> Dependency {
@@ -277,8 +1278,11 @@ fn layer_barrier_stress(
 
     for lane in 0..lanes {
         jobs.push(
-            JobSpec::new(WorkProfile::busy(follower_iterations), [write_key(lane, true)])
-                .with_predecessors([lane]),
+            JobSpec::new(
+                WorkProfile::busy(follower_iterations),
+                [write_key(lane, true)],
+            )
+            .with_predecessors([lane]),
         );
     }
 
@@ -310,8 +1314,11 @@ fn straggler_partial_overlap(
 
     for lane in 0..lanes {
         jobs.push(
-            JobSpec::new(WorkProfile::busy(follower_iterations), [write_key(lane, true)])
-                .with_predecessors([lane]),
+            JobSpec::new(
+                WorkProfile::busy(follower_iterations),
+                [write_key(lane, true)],
+            )
+            .with_predecessors([lane]),
         );
     }
 
@@ -351,7 +1358,9 @@ fn fan_out_fan_in(
 
     Workload::new(
         "fan_out_fan_in",
-        format!("fanout{fan_out}_root{root_iterations}_leaf{leaf_iterations}_sink{sink_iterations}"),
+        format!(
+            "fanout{fan_out}_root{root_iterations}_leaf{leaf_iterations}_sink{sink_iterations}"
+        ),
         jobs,
     )
 }
@@ -365,10 +1374,19 @@ fn mixed_hotspots(blocks: usize) -> Workload {
         let hot = 1 + (block % 4);
 
         jobs.push(JobSpec::new(WorkProfile::busy(400), [read_key(0, false)]));
-        jobs.push(JobSpec::new(WorkProfile::busy(1_100), [write_key(0, false)]));
-        jobs.push(JobSpec::new(WorkProfile::busy(2_200), [write_key(hot, true)]));
+        jobs.push(JobSpec::new(
+            WorkProfile::busy(1_100),
+            [write_key(0, false)],
+        ));
+        jobs.push(JobSpec::new(
+            WorkProfile::busy(2_200),
+            [write_key(hot, true)],
+        ));
         jobs.push(JobSpec::new(WorkProfile::busy(500), [read_key(hot, false)]));
-        jobs.push(JobSpec::new(WorkProfile::busy(900), [write_key(lane, false)]));
+        jobs.push(JobSpec::new(
+            WorkProfile::busy(900),
+            [write_key(lane, false)],
+        ));
         jobs.push(JobSpec::new(
             WorkProfile::busy(700),
             [read_key(lane, false), write_key(100 + (block % 3), true)],
@@ -486,9 +1504,8 @@ where
             BenchmarkId::new(workload.family, workload.name.as_str()),
             workload,
             |b, workload| {
-                b.iter(|| {
-                    black_box(A::compile(workload, benchmark_parallelism()).unwrap())
-                })
+                let state = A::make_state(workload);
+                b.iter(|| black_box(A::compile(workload, benchmark_parallelism(), &state).unwrap()))
             },
         );
     }
@@ -513,8 +1530,8 @@ fn bench_run_suite<A>(
             BenchmarkId::new(workload.family, workload.name.as_str()),
             workload,
             |b, workload| {
-                let mut compiled = A::compile(workload, benchmark_parallelism()).unwrap();
                 let state = A::make_state(workload);
+                let mut compiled = A::compile(workload, benchmark_parallelism(), &state).unwrap();
                 b.iter(|| {
                     A::run(&mut compiled, &state).unwrap();
                     black_box(A::sample(&state));
@@ -556,10 +1573,40 @@ fn bench_experiment_03(c: &mut Criterion) {
     bench_adapter::<ExperimentAdapter<experiment_03::Scheduler<BenchState>>>(c);
 }
 
+fn bench_dagga(c: &mut Criterion) {
+    bench_adapter::<DaggaAdapter>(c);
+}
+
+fn bench_dag_exec(c: &mut Criterion) {
+    bench_adapter::<DagExecAdapter>(c);
+}
+
+fn bench_shipyard(c: &mut Criterion) {
+    bench_adapter::<ShipyardAdapter>(c);
+}
+
+fn bench_legion(c: &mut Criterion) {
+    bench_adapter::<LegionAdapter>(c);
+}
+
+fn bench_bevy_ecs(c: &mut Criterion) {
+    bench_adapter::<BevyAdapter>(c);
+}
+
+fn bench_flecs(c: &mut Criterion) {
+    bench_adapter::<FlecsAdapter>(c);
+}
+
 criterion_group!(
     experiment_benches,
     bench_experiment_01,
     bench_experiment_02,
-    bench_experiment_03
+    bench_experiment_03,
+    bench_dagga,
+    bench_dag_exec,
+    bench_shipyard,
+    bench_legion,
+    bench_bevy_ecs,
+    bench_flecs
 );
 criterion_main!(experiment_benches);

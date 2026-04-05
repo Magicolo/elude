@@ -49,6 +49,13 @@ The current harness now provides:
   - `BenchAdapter`
 - a generic local adapter:
   - `ExperimentAdapter<T>` for any `experiment::Scheduler<BenchState>`
+- external adapters added later during task `05`:
+  - `DaggaAdapter`
+  - `DagExecAdapter`
+  - `ShipyardAdapter`
+  - `LegionAdapter`
+  - `BevyAdapter`
+  - `FlecsAdapter`
 - a lightweight benchmark state:
   - `BenchState { slots: Box<[AtomicU64]> }`
 
@@ -59,6 +66,7 @@ Important design choices:
   - optional explicit predecessor hints
   - a compile-time weight hint derived from the work profile
 - the local experiments currently ignore explicit predecessor hints, but the IR keeps them for future external-library adapters
+- `BenchAdapter::compile` now takes a state reference because `dag_exec` captures runtime state inside compiled task closures
 - the runtime job body now uses deterministic loop counts rather than `Instant::now()` polling
 - the standard `0ms` suite uses `iterations = 0` and a per-job slot update, which is materially lighter than the previous spin-until-deadline approach
 - each benchmark suite is separated by intent:
@@ -66,7 +74,19 @@ Important design choices:
   - `experiment/run_overhead/<scheduler>`
   - `experiment/run_parallelism/<scheduler>`
 
-No Cargo dependency changes were needed for this task.
+No Cargo dependency changes were needed to complete the original local-only task `01`.
+
+Later, task `05` reused this same harness shape and added dev-dependencies for:
+
+- `dagga`
+- `dag_exec`
+- `shipyard`
+- `legion`
+- `bevy_ecs`
+- `bevy_tasks`
+- `bevy_utils`
+- `flecs_ecs`
+- `seq-macro`
 
 ## Scope
 
@@ -100,6 +120,15 @@ Recommended shape:
   - parallelism-sensitive workloads
 
 The adapter trait must be flexible enough for external libraries whose public API is not closure-list based.
+
+What this turned into in practice:
+
+- `dagga` uses workload-interned resource ids plus explicit predecessor overlays
+- `dag_exec` uses a conservative explicit DAG and captures `Arc<BenchState>` inside compiled closures
+- `shipyard` uses direct `WorkloadSystem` construction with native borrow metadata and native `after` edges
+- `legion` uses custom `Runnable` systems, native access scheduling, and synthetic order-token resources for explicit predecessors
+- `bevy_ecs` uses custom boxed `System` implementations, dynamic resource registration, and dynamic `SystemSet` labels
+- `flecs` uses dynamic systems, dynamic access terms, and native `DependsOn`
 
 ## Required Workloads
 
@@ -188,6 +217,14 @@ The workload IR must support adapters for libraries that:
 
 Do not hard-code the harness around the current local scheduler API only.
 
+This turned out to be essential, not theoretical. The final external set now spans:
+
+- batch schedulers
+- explicit DAG executors
+- ECS workload schedulers
+- graph-oriented ECS schedulers
+- pipeline/system schedulers
+
 ## Likely Files To Change
 
 - `Cargo.toml`
@@ -258,6 +295,22 @@ Important shapes:
 Commands run during this task:
 
 - `cargo bench --bench experiment --no-run`
+
+Additional verification after task `05` extended this harness:
+
+- `cargo check --bench experiment`
+- `cargo bench --bench experiment -- experiment/run_parallelism/dag_exec/layer_barrier_stress`
+- `cargo bench --bench experiment -- experiment/run_overhead/dag_exec/wide_independent/jobs512_zero`
+- `cargo bench --bench experiment -- experiment/run_overhead/shipyard/wide_independent/jobs512_zero`
+- `cargo bench --bench experiment -- experiment/run_overhead/legion/wide_independent/jobs512_zero`
+- `cargo bench --bench experiment -- experiment/run_overhead/bevy_ecs/wide_independent/jobs512_zero`
+- `cargo bench --bench experiment -- experiment/run_overhead/flecs/wide_independent/jobs512_zero`
+- `cargo bench --bench experiment -- experiment/run_parallelism/shipyard/layer_barrier_stress`
+- `cargo bench --bench experiment -- experiment/run_parallelism/legion/layer_barrier_stress`
+- `cargo bench --bench experiment -- experiment/run_parallelism/bevy_ecs/layer_barrier_stress`
+- `cargo bench --bench experiment -- experiment/run_parallelism/flecs/layer_barrier_stress`
+
+The `dagga` adapter also compiles through the shared benchmark target, but its schedule-time cost is high enough on the current benchmark sizes that filtered Criterion runs did not finish promptly during task `05`.
 - `cargo bench --bench experiment -- experiment/run_overhead/experiment_01/wide_independent/jobs512_zero`
 - `cargo bench --bench experiment -- experiment/run_parallelism/experiment_02/layer_barrier_stress`
 
@@ -273,6 +326,22 @@ Selected observed timings from the filtered verification runs:
   - about `225-230 µs`
 - `experiment/run_parallelism/experiment_02/layer_barrier_stress/lanes128_fast400_slow5000_follow2000`
   - about `1.08-1.89 ms`
+- `experiment/run_overhead/shipyard/wide_independent/jobs512_zero`
+  - about `114-139 µs`
+- `experiment/run_overhead/legion/wide_independent/jobs512_zero`
+  - about `378-440 µs`
+- `experiment/run_overhead/bevy_ecs/wide_independent/jobs512_zero`
+  - about `240-289 µs`
+- `experiment/run_overhead/flecs/wide_independent/jobs512_zero`
+  - about `43-55 µs`
+- `experiment/run_parallelism/shipyard/layer_barrier_stress/lanes128_fast400_slow5000_follow2000`
+  - about `1.76-1.83 ms`
+- `experiment/run_parallelism/legion/layer_barrier_stress/lanes128_fast400_slow5000_follow2000`
+  - about `1.72-1.90 ms`
+- `experiment/run_parallelism/bevy_ecs/layer_barrier_stress/lanes128_fast400_slow5000_follow2000`
+  - about `2.90-3.15 ms`
+- `experiment/run_parallelism/flecs/layer_barrier_stress/lanes128_fast400_slow5000_follow2000`
+  - about `14.66-19.03 ms`
 
 These numbers are only smoke-test results, not the final benchmark analysis.
 
@@ -281,3 +350,4 @@ These numbers are only smoke-test results, not the final benchmark analysis.
 - 2026-04-04: Task created. No benchmark refactor yet.
 - 2026-04-04: Replaced the old single-workload harness with a workload IR, local adapter layer, separated compile/overhead/parallelism suites, and a standard `0ms` benchmark family.
 - 2026-04-04: Verified the new bench target with `cargo bench --bench experiment --no-run` and filtered Criterion runs.
+- 2026-04-04: Task `05` extended the same harness to include `shipyard`, `legion`, `bevy_ecs`, and `flecs` as direct competitors, not just `dagga` and `dag_exec`.

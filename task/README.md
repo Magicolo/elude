@@ -1,7 +1,7 @@
 # Scheduler Experiment Task Plan
 
 Last updated: 2026-04-04
-Plan status: tasks `00` and `01` completed, remaining tasks not started
+Plan status: tasks `00`, `01`, and `05` completed, remaining experiment tasks not started
 
 ## Mission
 
@@ -55,7 +55,7 @@ Tasks `02`, `03`, and `04` can overlap conceptually once task `01` is in place, 
 | `02-experiment-01.md` | Not started | `01` preferred | Improve the dynamic reservation scheduler while preserving its identity |
 | `03-experiment-02.md` | Not started | `01` preferred | Improve the layered baseline while keeping it a layered scheduler |
 | `04-experiment-03.md` | Not started | `01` preferred | Improve the static DAG scheduler while keeping it a static DAG scheduler |
-| `05-external-libraries.md` | Not started | none | Research, select, and integrate external schedulers for comparison |
+| `05-external-libraries.md` | Completed | none | Research, select, integrate, and document external schedulers for comparison |
 | `06-experiment-04.md` | Not started | `01`, `05`, plus findings from `02-04` | Design and implement the new contrastive experiment |
 | `07-validation-and-results.md` | Not started | all prior tasks | Final tests, benchmark runs, results summary, and doc cleanup |
 
@@ -66,6 +66,13 @@ Tasks `02`, `03`, and `04` can overlap conceptually once task `01` is in place, 
 - Keep a short progress log in each task file with dates and concrete outcomes.
 - If the final design of `experiment_04` changes, update both `task/06-experiment-04.md` and this file before coding.
 - If external library selection changes, update both `task/05-external-libraries.md` and `task/01-benchmark-foundation.md`.
+- If ECS competitor integration changes, also update:
+  - `task/05-dagga.md`
+  - `task/05-dag-exec.md`
+  - `task/05-shipyard.md`
+  - `task/05-legion.md`
+  - `task/05-bevy-ecs.md`
+  - `task/05-flecs.md`
 - Benchmark notes should record:
   - command used
   - machine parallelism used
@@ -81,6 +88,7 @@ The overall project is done when:
 - there is a standard `0ms` benchmark for all schedulers
 - the workloads clearly expose where each scheduler wins or loses on parallelism
 - at least two relevant external schedulers are benchmarked and their implementation ideas are documented
+- the direct ECS competitors requested by the user are benchmarked through mappings that are explicit about any semantic caveats
 - the task files in this folder reflect the actual final state and decisions
 
 ## First File To Read
@@ -92,3 +100,5 @@ If you are starting fresh, read `task/00-current-state.md` next.
 - 2026-04-04: Created the initial task dossier.
 - 2026-04-04: Completed task `00` and verified the repo was clean at that time.
 - 2026-04-04: Completed task `01` with a refactored benchmark IR, local adapter layer, standard `0ms` suite, and new parallelism-oriented workloads.
+- 2026-04-04: Completed task `05` first by integrating `dagga` and `dag_exec`.
+- 2026-04-04: Revised task `05` after the user required direct ECS benchmarking, then integrated `shipyard`, `legion`, `bevy_ecs`, and `flecs` and added one deep-dive task file per ECS competitor.
