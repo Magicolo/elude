@@ -35,7 +35,7 @@ use elude::{
         Order::{Relax, Strict},
     },
     experiment::{CompiledSchedule as _, Job, Scheduler as _},
-    experiment_01, experiment_02, experiment_03, experiment_04,
+    experiment_01, experiment_02, experiment_03, experiment_04, experiment_05,
 };
 use flecs_ecs::core::{
     Entity as FlecsEntity, IdOperations as _, QueryBuilderImpl as _, SystemAPI as _,
@@ -1770,6 +1770,10 @@ fn bench_experiment_04(c: &mut Criterion) {
     bench_adapter::<Experiment04AdaptiveAdapter>(c);
 }
 
+fn bench_experiment_05(c: &mut Criterion) {
+    bench_adapter::<ExperimentAdapter<experiment_05::Scheduler<BenchState>>>(c);
+}
+
 fn bench_experiment_04_critical_path(c: &mut Criterion) {
     bench_adapter::<Experiment04CriticalPathAdapter>(c);
 }
@@ -1812,6 +1816,7 @@ criterion_group!(
     bench_experiment_02,
     bench_experiment_03,
     bench_experiment_04,
+    bench_experiment_05,
     bench_experiment_04_critical_path,
     bench_experiment_04_read_heavy,
     bench_experiment_04_hot_contention,

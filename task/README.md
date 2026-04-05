@@ -1,7 +1,7 @@
 # Scheduler Experiment Task Plan
 
 Last updated: 2026-04-05
-Plan status: all planned tasks are completed
+Plan status: original tasks `00-07` are completed; post-plan task `08` is in progress
 
 ## Mission
 
@@ -18,7 +18,8 @@ The user-defined priorities are:
 - make benchmarks expose parallelism differences, not just generic throughput
 - add a standard `0ms` job benchmark to estimate runner overhead
 
-The implementation work is now complete. This folder is the execution dossier and final result record for the experiment program.
+The original implementation work is complete. This folder is now also the
+ongoing research dossier for post-plan work such as `experiment_05`.
 
 ## Important Context
 
@@ -91,6 +92,8 @@ The overall project is done when:
 - at least two relevant external schedulers are benchmarked and their implementation ideas are documented
 - the direct ECS competitors requested by the user are benchmarked through mappings that are explicit about any semantic caveats
 - the task files in this folder reflect the actual final state and decisions
+- post-plan research tasks document prototype implementations and measured
+  outcomes as they evolve
 
 ## First File To Read
 
@@ -108,3 +111,4 @@ If you are starting fresh, read `task/00-current-state.md` next.
 - 2026-04-05: Completed task `04` by keeping `experiment_03` as a static DAG scheduler but switching its executor to criticality-ordered work-first wakeups, which sharply reduced per-ready-node runtime overhead on the benchmark harness.
 - 2026-04-05: Completed task `06` by implementing `experiment_04` as a portfolio of static-DAG variants with adaptive selection, fixed benchmarkable modes, and a new `portfolio_bridge_tradeoff` workload family that exposes when multiple legal orientations materially differ.
 - 2026-04-05: Completed task `07` by passing the final hygiene and test checks, attempting the full benchmark sweep, then finishing with a bounded representative final matrix and a dedicated summary in `task/07-results-summary.md`.
+- 2026-04-05: Added post-plan task `08-experiment-05.md`, built the first working `experiment_05` prototype, integrated it into the benchmark harness, and recorded the first grounded performance results.

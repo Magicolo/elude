@@ -5,6 +5,7 @@ pub mod experiment_01;
 pub mod experiment_02;
 pub mod experiment_03;
 pub mod experiment_04;
+pub mod experiment_05;
 pub mod graph;
 pub mod job;
 mod utility;
