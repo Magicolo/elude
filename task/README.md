@@ -1,7 +1,7 @@
 # Scheduler Experiment Task Plan
 
 Last updated: 2026-04-05
-Plan status: tasks `00`, `01`, `02`, `03`, `04`, `05`, and `06` completed, only final validation remains
+Plan status: all planned tasks are completed
 
 ## Mission
 
@@ -18,7 +18,7 @@ The user-defined priorities are:
 - make benchmarks expose parallelism differences, not just generic throughput
 - add a standard `0ms` job benchmark to estimate runner overhead
 
-No implementation was performed in this planning pass. This folder is the execution dossier for later prompts.
+The implementation work is now complete. This folder is the execution dossier and final result record for the experiment program.
 
 ## Important Context
 
@@ -29,7 +29,8 @@ No implementation was performed in this planning pass. This folder is the execut
   - `src/experiment_01`
   - `src/experiment_02`
   - `src/experiment_03`
-- Shared correctness tests live in `tests/support/mod.rs` and the per-experiment test entry points under `tests/experiment_0{1,2,3}.rs`.
+  - `src/experiment_04`
+- Shared correctness tests live in `tests/support/mod.rs` and the per-experiment test entry points under `tests/experiment_0{1,2,3,4}.rs`.
 
 ## Recommended Execution Order
 
@@ -57,7 +58,7 @@ Tasks `02`, `03`, and `04` can overlap conceptually once task `01` is in place, 
 | `04-experiment-03.md` | Completed | `01` preferred | Improve the static DAG scheduler while keeping it a static DAG scheduler |
 | `05-external-libraries.md` | Completed | none | Research, select, integrate, and document external schedulers for comparison |
 | `06-experiment-04.md` | Completed | `01`, `05`, plus findings from `02-04` | Design and implement the new contrastive experiment |
-| `07-validation-and-results.md` | Not started | all prior tasks | Final tests, benchmark runs, results summary, and doc cleanup |
+| `07-validation-and-results.md` | Completed | all prior tasks | Final tests, benchmark runs, results summary, and doc cleanup |
 
 ## Rules For Future Agents
 
@@ -106,3 +107,4 @@ If you are starting fresh, read `task/00-current-state.md` next.
 - 2026-04-05: Completed task `03` by upgrading `experiment_02` to a dual-layout compiler that compares classic first-fit grouping against a stricter frontier-batch heuristic and keeps the better thread-aware layout while preserving the same group-by-group runtime.
 - 2026-04-05: Completed task `04` by keeping `experiment_03` as a static DAG scheduler but switching its executor to criticality-ordered work-first wakeups, which sharply reduced per-ready-node runtime overhead on the benchmark harness.
 - 2026-04-05: Completed task `06` by implementing `experiment_04` as a portfolio of static-DAG variants with adaptive selection, fixed benchmarkable modes, and a new `portfolio_bridge_tradeoff` workload family that exposes when multiple legal orientations materially differ.
+- 2026-04-05: Completed task `07` by passing the final hygiene and test checks, attempting the full benchmark sweep, then finishing with a bounded representative final matrix and a dedicated summary in `task/07-results-summary.md`.
