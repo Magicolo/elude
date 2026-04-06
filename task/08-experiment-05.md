@@ -751,6 +751,29 @@ The main changes were:
 The last item is especially important. It means `experiment_05` no longer pays
 cluster machinery at all on the “just run many independent jobs” shape.
 
+## Optimization Round 3
+
+The next pass added schedule-level specializations on top of the cluster
+runtime.
+
+The main additions were:
+
+- a `SingletonDag` specialization for schedules that compile entirely to
+  singleton clusters
+- a `SerialChain` specialization for schedules whose final dependency graph is a
+  single linear chain
+- removal of the eager wait-counter reset sweep from the singleton-DAG hot path
+
+The design intent is simple:
+
+- if clustering collapses completely to one-job clusters, `05` should stop
+  pretending it is a cluster runtime and run a direct work-first DAG path
+- if the final graph is globally serial, `05` should just run a plain loop
+
+This keeps the cluster-automata representation as the default, but lets the
+compiled schedule escape to a cheaper runtime when the structure proves that the
+full machinery is unnecessary.
+
 ## Grounded Benchmark Results
 
 Commands used:
@@ -775,7 +798,7 @@ comparison.
 ### Best Signals
 
 - `run_overhead / wide_independent / jobs512_zero`
-  - `experiment_05`: about `31.06 µs .. 31.50 µs`
+  - `experiment_05`: about `31.12 µs .. 31.78 µs`
   - `experiment_03`: about `264.92 µs .. 269.18 µs`
   - interpretation:
     - the schedule-level trivial-parallel fast path turned this into a major
@@ -786,11 +809,12 @@ comparison.
   - interpretation:
     - `05` is now effectively tied with `03` on this barrier-heavy case
 - `run_parallelism / portfolio_bridge_tradeoff / pre96...post32...`
-  - `experiment_05`: about `500.33 µs .. 508.44 µs`
+  - `experiment_05`: about `490.26 µs .. 495.77 µs`
   - `experiment_03`: about `528.47 µs .. 531.91 µs`
   - `experiment_04`: about `1.351 ms .. 1.394 ms`
   - interpretation:
-    - `05` now beats both `03` and `04` on the pre-heavy bridge shape
+    - the singleton-DAG specialization improved this shape further and `05`
+      still beats both `03` and `04` here
 - `run_parallelism / mixed_hotspots / blocks48`
   - `experiment_05`: about `1.511 ms .. 1.535 ms`
   - `experiment_03`: about `1.508 ms .. 1.560 ms`
@@ -801,18 +825,18 @@ comparison.
 ### Current Weak Spots
 
 - `run_overhead / hot_key_write_contention / jobs256_zero`
-  - `experiment_05`: about `7.75 µs .. 8.34 µs`
-  - `experiment_03`: about `6.10 µs .. 6.36 µs`
+  - `experiment_05`: about `1.009 µs .. 1.022 µs`
+  - `experiment_03`: about `6.052 µs .. 6.275 µs`
   - interpretation:
-    - the serial fast path helped enormously, but `03` is still ahead on the
-      pure zero-work serialized hotspot
+    - the serial-chain specialization completely flipped this case and `05` is
+      now far ahead of `03`
 - `run_parallelism / portfolio_bridge_tradeoff / pre32...post96...`
-  - `experiment_05`: about `535.46 µs .. 537.79 µs`
+  - `experiment_05`: about `527.59 µs .. 530.32 µs`
   - `experiment_03`: about `493.49 µs .. 501.20 µs`
   - `experiment_04`: about `1.320 ms .. 1.390 ms`
   - interpretation:
-    - `05` still loses this bridge orientation to `03`, even though it remains
-      far ahead of `04`
+    - the singleton-DAG path helped slightly, but `05` still loses this bridge
+      orientation to `03`, even though it remains far ahead of `04`
 
 ### Compile Cost
 
@@ -831,9 +855,9 @@ The prototype is now substantially stronger than the first `05` version.
 - it now beats `03` very clearly on `wide_independent/jobs512_zero`
 - it ties `03` on `layer_barrier_stress`
 - it beats `03` and `04` on the pre-heavy bridge shape
+- it now beats `03` decisively on the zero-work serialized hotspot case
 - it is in the same class as `03` on `mixed_hotspots`
 - it is still behind `03` on:
-  - zero-work serialized write hotspots
   - the post-heavy bridge orientation
 
 That means the next likely improvements are:
@@ -841,7 +865,8 @@ That means the next likely improvements are:
 - keep the cluster-automata representation
 - add a better local policy or cluster shape for the post-heavy bridge
   orientation
-- continue shrinking the residual gap on the pure serialized hotspot path
+- continue specializing schedules whose cluster structure degenerates into a
+  simpler runtime model
 
 ## Files Added So Far
 
@@ -905,3 +930,11 @@ for all of the following:
   `layer_barrier_stress`, beats `03` on the pre-heavy bridge shape, stays close
   to `03` on `mixed_hotspots`, and narrows the serialized hotspot gap from
   roughly `47-49 µs` down to roughly `7.7-8.3 µs`.
+- 2026-04-05: Added a third optimization round with a singleton-DAG
+  specialization for all-singleton schedules and a serial-chain specialization
+  for globally serial schedules.
+- 2026-04-05: Verified that the serial-chain fast path reduced
+  `hot_key_write_contention/jobs256_zero` to roughly `1.01 µs`, far ahead of
+  `experiment_03`, while the singleton-DAG fast path improved the pre-heavy
+  bridge shape to roughly `490-496 µs` and nudged the post-heavy bridge shape
+  down to roughly `528-530 µs`.

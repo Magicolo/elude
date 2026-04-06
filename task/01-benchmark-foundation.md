@@ -76,6 +76,7 @@ Important design choices:
 - the standard `0ms` suite uses `iterations = 0` and a per-job slot update, which is materially lighter than the previous spin-until-deadline approach
 - each benchmark suite is separated by intent:
   - `experiment/compile/<scheduler>`
+  - `experiment/run_mainline/<scheduler>`
   - `experiment/run_overhead/<scheduler>`
   - `experiment/run_parallelism/<scheduler>`
 
@@ -296,6 +297,23 @@ Important shapes:
 - `fan_out_fan_in` is root write, many shared reads, then sink write on the same key
 - `compile_heavy_sparse_keys` uses many multi-key jobs with sparse shared buckets to stress schedule-time logic without relying on runtime work
 
+2026-04-05 mainline extension:
+
+- the harness now has one explicit "main comparison" family named `realistic_random_main`
+- that family is deterministic from a fixed seed, not per-run entropy
+- it currently uses:
+  - `384` resources
+  - `2048` jobs
+  - `32` coarse layers
+  - hot global resources, warm shared resources, and shard-local resources
+  - mixed read/write and strict/relaxed declarations
+  - explicit predecessor hints on top of resource conflicts
+  - synthetic work targets spanning `0us` to `2500us` (`0.0ms` to `2.5ms`)
+- the current implementation maps those target durations to deterministic loop counts with a fixed scale factor of `30` synthetic iterations per microsecond
+- that scale is intentionally deterministic so the generated jobs are identical on every run; the benchmark is modeling the requested time band, not sleeping against wall clock
+- `run_mainline` is now the primary runtime comparison suite, while `run_overhead` and `run_parallelism` remain secondary diagnostics
+- `compile` remains separate and now includes `realistic_random_main` directly, so schedule-time is measured on the same large scenario instead of only on smaller synthetic families
+
 ## Concrete Execution Plan
 
 1. Freeze the old harness behavior by reading and understanding it before changing structure.
@@ -335,6 +353,9 @@ Additional verification after task `05` extended this harness:
 - `cargo bench --bench experiment -- experiment/run_parallelism/legion/layer_barrier_stress`
 - `cargo bench --bench experiment -- experiment/run_parallelism/bevy_ecs/layer_barrier_stress`
 - `cargo bench --bench experiment -- experiment/run_parallelism/flecs/layer_barrier_stress`
+- `cargo bench --bench experiment -- experiment/compile/experiment_05/realistic_random_main`
+- `cargo bench --bench experiment -- experiment/run_mainline/experiment_05/realistic_random_main`
+- `cargo bench --bench experiment -- experiment/run_mainline/shipyard/realistic_random_main`
 
 The `dagga` adapter also compiles through the shared benchmark target, but its schedule-time cost is high enough on the current benchmark sizes that filtered Criterion runs did not finish promptly during task `05`.
 - `cargo bench --bench experiment -- experiment/run_overhead/experiment_01/wide_independent/jobs512_zero`
@@ -368,6 +389,12 @@ Selected observed timings from the filtered verification runs:
   - about `2.90-3.15 ms`
 - `experiment/run_parallelism/flecs/layer_barrier_stress/lanes128_fast400_slow5000_follow2000`
   - about `14.66-19.03 ms`
+- `experiment/compile/experiment_05/realistic_random_main/seed5eedcafed00dbeef_res384_jobs2048_layers32`
+  - about `48.8-51.8 ms`
+- `experiment/run_mainline/experiment_05/realistic_random_main/seed5eedcafed00dbeef_res384_jobs2048_layers32`
+  - about `5.14-5.62 ms`
+- `experiment/run_mainline/shipyard/realistic_random_main/seed5eedcafed00dbeef_res384_jobs2048_layers32`
+  - about `178.2-183.3 ms`
 
 These numbers are only smoke-test results, not the final benchmark analysis.
 
@@ -377,3 +404,4 @@ These numbers are only smoke-test results, not the final benchmark analysis.
 - 2026-04-04: Replaced the old single-workload harness with a workload IR, local adapter layer, separated compile/overhead/parallelism suites, and a standard `0ms` benchmark family.
 - 2026-04-04: Verified the new bench target with `cargo bench --bench experiment --no-run` and filtered Criterion runs.
 - 2026-04-04: Task `05` extended the same harness to include `shipyard`, `legion`, `bevy_ecs`, and `flecs` as direct competitors, not just `dagga` and `dag_exec`.
+- 2026-04-05: Added `run_mainline` plus the fixed-seed `realistic_random_main` workload so every scheduler now benchmarks the same large mixed-dependency scenario with hundreds of resources, thousands of jobs, and target work from `0.0ms` to `2.5ms`, while compile time remains measured separately.

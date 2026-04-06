@@ -137,11 +137,26 @@ struct Cluster<S> {
     priority_height: u32,
 }
 
+struct SingletonNode<S> {
+    run: SharedRun<S>,
+    wait_initial: u32,
+    wait: AtomicU32,
+    successor_range: Range<u32>,
+}
+
+struct SingletonDag<S> {
+    nodes: Box<[SingletonNode<S>]>,
+    successors: Box<[JobId]>,
+    roots: Box<[JobId]>,
+}
+
 pub struct Schedule<S: Sync> {
     pool: ThreadPool,
     clusters: Box<[Cluster<S>]>,
     roots: Box<[ClusterId]>,
+    serial_chain_runs: Option<Box<[SharedRun<S>]>>,
     trivial_parallel: bool,
+    singleton_dag: Option<SingletonDag<S>>,
 }
 
 struct RunContext<'schedule, 'state, 'sync, S: Sync> {
@@ -182,7 +197,9 @@ impl<S: Sync> Schedule<S> {
                 pool: ThreadPoolBuilder::new().num_threads(1).build()?,
                 clusters: Vec::new().into_boxed_slice(),
                 roots: Vec::new().into_boxed_slice(),
+                serial_chain_runs: Some(Vec::new().into_boxed_slice()),
                 trivial_parallel: true,
+                singleton_dag: None,
             });
         }
 
@@ -233,6 +250,8 @@ impl<S: Sync> Schedule<S> {
             build_final_predecessors(&pending, &fixed_predecessors, &priority, &rank, &placements);
         let final_successors = build_successors(&final_predecessors);
         let final_heights = build_final_heights(&priority, &final_successors);
+        let serial_chain_runs =
+            build_serial_chain_runs(&pending, &final_predecessors, &final_successors);
         let (clusters, roots) = build_compiled_clusters(
             cluster_jobs,
             placements,
@@ -244,6 +263,9 @@ impl<S: Sync> Schedule<S> {
             &stats,
         );
         let trivial_parallel = is_trivial_parallel_schedule(&clusters, &roots);
+        let singleton_dag = (!trivial_parallel)
+            .then(|| build_singleton_dag(&clusters, &roots))
+            .flatten();
 
         let threads = parallelism
             .or_else(|| thread::available_parallelism().ok())
@@ -255,11 +277,20 @@ impl<S: Sync> Schedule<S> {
             pool,
             clusters: clusters.into_boxed_slice(),
             roots: roots.into_boxed_slice(),
+            serial_chain_runs,
             trivial_parallel,
+            singleton_dag,
         })
     }
 
     pub fn run(&mut self, state: &S) -> Result<()> {
+        if let Some(serial_chain_runs) = self.serial_chain_runs.as_ref() {
+            for run in serial_chain_runs.iter() {
+                run(state)?;
+            }
+            return Ok(());
+        }
+
         if self.trivial_parallel {
             return self.pool.install(|| {
                 self.clusters.par_iter().try_for_each(|cluster| {
@@ -267,6 +298,9 @@ impl<S: Sync> Schedule<S> {
                     (job.run)(state)
                 })
             });
+        }
+        if let Some(singleton_dag) = self.singleton_dag.as_ref() {
+            return run_singleton_dag(&self.pool, singleton_dag, state);
         }
 
         self.prepare_run();
@@ -872,6 +906,50 @@ fn build_final_heights(priority: &[JobId], successors: &[Vec<JobId>]) -> Vec<u32
     heights
 }
 
+fn build_serial_chain_runs<S>(
+    pending: &[PendingJob<S>],
+    predecessors: &[Vec<JobId>],
+    successors: &[Vec<JobId>],
+) -> Option<Box<[SharedRun<S>]>> {
+    if pending.is_empty() {
+        return Some(Vec::new().into_boxed_slice());
+    }
+
+    if predecessors.iter().any(|preds| preds.len() > 1)
+        || successors.iter().any(|succs| succs.len() > 1)
+    {
+        return None;
+    }
+
+    let roots = predecessors
+        .iter()
+        .enumerate()
+        .filter_map(|(job, preds)| preds.is_empty().then_some(job as JobId))
+        .collect::<Vec<_>>();
+    let [root] = roots.as_slice() else {
+        return None;
+    };
+
+    let mut order = Vec::with_capacity(pending.len());
+    let mut current = Some(*root);
+    while let Some(job) = current {
+        order.push(job);
+        current = successors[job as usize].first().copied();
+    }
+
+    if order.len() != pending.len() {
+        return None;
+    }
+
+    Some(
+        order
+            .into_iter()
+            .map(|job| Arc::clone(&pending[job as usize].run))
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_compiled_clusters<S>(
     cluster_jobs: Vec<Vec<JobId>>,
@@ -1062,6 +1140,69 @@ fn is_trivial_parallel_schedule<S>(clusters: &[Cluster<S>], roots: &[ClusterId])
                 && cluster.local_successors.is_empty()
                 && cluster.remote_successors.is_empty()
         })
+}
+
+fn build_singleton_dag<S>(clusters: &[Cluster<S>], roots: &[ClusterId]) -> Option<SingletonDag<S>> {
+    if !clusters.iter().all(|cluster| {
+        cluster.jobs.len() == 1
+            && cluster.local_successors.is_empty()
+            && cluster.jobs[0].local_predecessor_mask == 0
+    }) {
+        return None;
+    }
+
+    let mut nodes = Vec::with_capacity(clusters.len());
+    let mut successors = Vec::new();
+    for cluster in clusters.iter() {
+        let job = &cluster.jobs[0];
+        let start = successors.len() as u32;
+        for successor in remote_successors(cluster, job).iter().copied() {
+            debug_assert_eq!(successor.job, 0);
+            successors.push(successor.cluster);
+        }
+        let end = successors.len() as u32;
+        nodes.push(SingletonNode {
+            run: Arc::clone(&job.run),
+            wait_initial: job.external_wait_initial,
+            wait: AtomicU32::new(job.external_wait_initial),
+            successor_range: start..end,
+        });
+    }
+
+    Some(SingletonDag {
+        nodes: nodes.into_boxed_slice(),
+        successors: successors.into_boxed_slice(),
+        roots: roots.to_vec().into_boxed_slice(),
+    })
+}
+
+fn run_singleton_dag<S: Sync>(pool: &ThreadPool, dag: &SingletonDag<S>, state: &S) -> Result<()> {
+    let errors = Mutex::new(Vec::new());
+    let cancelled = AtomicBool::new(false);
+
+    pool.scope(|scope| {
+        let mut roots = dag.roots.iter().copied();
+        if let Some(root) = roots.next() {
+            for root in roots {
+                spawn_singleton_ready(dag, state, &errors, &cancelled, root, scope);
+            }
+            run_singleton_chain(dag, state, &errors, &cancelled, root, scope);
+        }
+    });
+
+    let mut errors = errors.into_inner();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        reset_singleton_dag(dag);
+        Err(errors.remove(0))
+    }
+}
+
+fn reset_singleton_dag<S>(dag: &SingletonDag<S>) {
+    for node in dag.nodes.iter() {
+        node.wait.store(node.wait_initial, Relaxed);
+    }
 }
 
 fn try_spawn_cluster<'context, 'schedule, 'state, 'sync, 'scope, S: Sync>(
@@ -1266,6 +1407,76 @@ fn wake_remote_successors<'context, 'schedule, 'state, 'sync, 'scope, S: Sync>(
     }
 }
 
+fn spawn_singleton_ready<'state, 'sync, 'scope, S: Sync>(
+    dag: &'scope SingletonDag<S>,
+    state: &'state S,
+    errors: &'sync Mutex<Vec<anyhow::Error>>,
+    cancelled: &'sync AtomicBool,
+    job: JobId,
+    scope: &RayonScope<'scope>,
+) where
+    'state: 'scope,
+    'sync: 'scope,
+{
+    if cancelled.load(Acquire) {
+        return;
+    }
+
+    let node = &dag.nodes[job as usize];
+    debug_assert_eq!(node.wait.load(Relaxed), 0);
+    scope.spawn(move |scope| run_singleton_chain(dag, state, errors, cancelled, job, scope));
+}
+
+fn run_singleton_chain<'state, 'sync, 'scope, S: Sync>(
+    dag: &'scope SingletonDag<S>,
+    state: &'state S,
+    errors: &'sync Mutex<Vec<anyhow::Error>>,
+    cancelled: &'sync AtomicBool,
+    mut job: JobId,
+    scope: &RayonScope<'scope>,
+) where
+    'state: 'scope,
+    'sync: 'scope,
+{
+    loop {
+        if cancelled.load(Acquire) {
+            return;
+        }
+
+        let node = &dag.nodes[job as usize];
+        debug_assert_eq!(node.wait.load(Relaxed), 0);
+        let result = (node.run)(state);
+        node.wait.store(node.wait_initial, Release);
+
+        match result {
+            Ok(()) if !cancelled.load(Acquire) => {
+                let mut next_inline = None;
+                for &successor in singleton_successors(dag, node).iter() {
+                    let successor_node = &dag.nodes[successor as usize];
+                    if successor_node.wait.fetch_sub(1, AcqRel) == 1 {
+                        if next_inline.is_none() {
+                            next_inline = Some(successor);
+                        } else {
+                            spawn_singleton_ready(dag, state, errors, cancelled, successor, scope);
+                        }
+                    }
+                }
+
+                match next_inline {
+                    Some(successor) => job = successor,
+                    None => return,
+                }
+            }
+            Ok(()) => return,
+            Err(error) => {
+                cancelled.store(true, Release);
+                errors.lock().push(error);
+                return;
+            }
+        }
+    }
+}
+
 fn compare_ready_job<S: Sync>(
     schedule: &Schedule<S>,
     cluster_id: ClusterId,
@@ -1361,6 +1572,13 @@ fn remote_successors<'cluster, S>(
 ) -> &'cluster [RemoteSuccessor] {
     &cluster.remote_successors
         [job.remote_successor_range.start as usize..job.remote_successor_range.end as usize]
+}
+
+fn singleton_successors<'dag, S>(
+    dag: &'dag SingletonDag<S>,
+    node: &SingletonNode<S>,
+) -> &'dag [JobId] {
+    &dag.successors[node.successor_range.start as usize..node.successor_range.end as usize]
 }
 
 fn local_successors_slice<'slice, S>(

@@ -77,6 +77,74 @@ use std::{
 
 const SHIPYARD_MAX_BENCH_JOBS: usize = 4096;
 const LEGION_MAX_BENCH_RESOURCE_IDS: usize = 6144;
+const MAINLINE_RANDOM_SEED: u64 = 0x5eed_cafe_d00d_beef;
+const MAINLINE_RANDOM_RESOURCE_COUNT: usize = 384;
+const MAINLINE_RANDOM_JOB_COUNT: usize = 2_048;
+const MAINLINE_RANDOM_LAYER_COUNT: usize = 32;
+const MAINLINE_RANDOM_HOT_RESOURCE_COUNT: usize = 24;
+const MAINLINE_RANDOM_WARM_RESOURCE_COUNT: usize = 96;
+const MAINLINE_RANDOM_SHARD_COUNT: usize = 24;
+const MAINLINE_RANDOM_LOCAL_RESOURCE_COUNT: usize = (MAINLINE_RANDOM_RESOURCE_COUNT
+    - MAINLINE_RANDOM_HOT_RESOURCE_COUNT
+    - MAINLINE_RANDOM_WARM_RESOURCE_COUNT)
+    / MAINLINE_RANDOM_SHARD_COUNT;
+const MAINLINE_RANDOM_ITERATIONS_PER_MICROSECOND: u32 = 30;
+
+const _: () = {
+    assert!(
+        MAINLINE_RANDOM_HOT_RESOURCE_COUNT
+            + MAINLINE_RANDOM_WARM_RESOURCE_COUNT
+            + (MAINLINE_RANDOM_SHARD_COUNT * MAINLINE_RANDOM_LOCAL_RESOURCE_COUNT)
+            == MAINLINE_RANDOM_RESOURCE_COUNT
+    );
+    assert!(MAINLINE_RANDOM_RESOURCE_COUNT <= LEGION_MAX_BENCH_RESOURCE_IDS);
+    assert!(MAINLINE_RANDOM_JOB_COUNT <= SHIPYARD_MAX_BENCH_JOBS);
+};
+
+#[derive(Clone, Debug)]
+struct DeterministicRng {
+    state: u64,
+}
+
+impl DeterministicRng {
+    fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+
+    fn index(&mut self, upper: usize) -> usize {
+        debug_assert!(upper > 0);
+        (self.next_u64() % (upper as u64)) as usize
+    }
+
+    fn chance(&mut self, numerator: u32, denominator: u32) -> bool {
+        debug_assert!(denominator > 0);
+        debug_assert!(numerator <= denominator);
+        (self.next_u64() % (denominator as u64)) < (numerator as u64)
+    }
+
+    fn weighted_index(&mut self, weights: &[u32]) -> usize {
+        let total = weights.iter().copied().sum::<u32>();
+        debug_assert!(total > 0);
+
+        let mut ticket = (self.next_u64() % (total as u64)) as u32;
+        for (index, weight) in weights.iter().copied().enumerate() {
+            if ticket < weight {
+                return index;
+            }
+            ticket -= weight;
+        }
+
+        weights.len() - 1
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 struct WorkProfile {
@@ -1369,6 +1437,392 @@ fn read_key(key: usize, strict: bool) -> Dependency {
     Read(Identifier(key), if strict { Strict } else { Relax })
 }
 
+fn work_target_us(target_us: u32) -> WorkProfile {
+    if target_us == 0 {
+        WorkProfile::ZERO
+    } else {
+        WorkProfile::busy(target_us.saturating_mul(MAINLINE_RANDOM_ITERATIONS_PER_MICROSECOND))
+    }
+}
+
+fn weighted_duration_us(rng: &mut DeterministicRng, options: &[(u32, u32)]) -> u32 {
+    let total = options.iter().map(|(_, weight)| *weight).sum::<u32>();
+    debug_assert!(total > 0);
+
+    let mut ticket = (rng.next_u64() % (total as u64)) as u32;
+    for &(duration_us, weight) in options {
+        if ticket < weight {
+            return duration_us;
+        }
+        ticket -= weight;
+    }
+
+    options[options.len() - 1].0
+}
+
+fn mainline_hot_resource(rng: &mut DeterministicRng) -> usize {
+    rng.index(MAINLINE_RANDOM_HOT_RESOURCE_COUNT)
+}
+
+fn mainline_warm_resource(rng: &mut DeterministicRng) -> usize {
+    MAINLINE_RANDOM_HOT_RESOURCE_COUNT + rng.index(MAINLINE_RANDOM_WARM_RESOURCE_COUNT)
+}
+
+fn mainline_local_resource(shard: usize, slot: usize) -> usize {
+    debug_assert!(shard < MAINLINE_RANDOM_SHARD_COUNT);
+    debug_assert!(slot < MAINLINE_RANDOM_LOCAL_RESOURCE_COUNT);
+
+    MAINLINE_RANDOM_HOT_RESOURCE_COUNT
+        + MAINLINE_RANDOM_WARM_RESOURCE_COUNT
+        + (shard * MAINLINE_RANDOM_LOCAL_RESOURCE_COUNT)
+        + slot
+}
+
+fn mainline_random_local_resource(rng: &mut DeterministicRng, shard: usize) -> usize {
+    mainline_local_resource(shard, rng.index(MAINLINE_RANDOM_LOCAL_RESOURCE_COUNT))
+}
+
+fn push_recent_predecessor(
+    predecessors: &mut Vec<usize>,
+    candidates: &[usize],
+    rng: &mut DeterministicRng,
+) {
+    if candidates.is_empty() {
+        return;
+    }
+
+    let window = candidates.len().min(24);
+    let offset = rng.index(window);
+    predecessors.push(candidates[candidates.len() - 1 - offset]);
+}
+
+fn push_previous_layer_predecessor(
+    predecessors: &mut Vec<usize>,
+    layer_jobs: &[Vec<usize>],
+    layer: usize,
+    rng: &mut DeterministicRng,
+) {
+    if layer == 0 {
+        return;
+    }
+
+    let lookback = 1 + rng.index(layer.min(3));
+    push_recent_predecessor(predecessors, &layer_jobs[layer - lookback], rng);
+}
+
+fn compact_dependencies(mut dependencies: Vec<Dependency>) -> Vec<Dependency> {
+    let mut compact = Vec::<Dependency>::with_capacity(dependencies.len());
+
+    for dependency in dependencies.drain(..) {
+        match dependency {
+            Dependency::Unknown => return vec![Dependency::Unknown],
+            Read(key, order) => {
+                let mut merged = false;
+                for existing in compact.iter_mut() {
+                    match existing {
+                        Read(existing_key, existing_order)
+                        | Write(existing_key, existing_order)
+                            if *existing_key == key =>
+                        {
+                            *existing_order = (*existing_order).max(order);
+                            merged = true;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                if !merged {
+                    compact.push(Read(key, order));
+                }
+            }
+            Write(key, order) => {
+                let mut merged = false;
+                for existing in compact.iter_mut() {
+                    match existing {
+                        Read(existing_key, existing_order) if *existing_key == key => {
+                            let merged_order = (*existing_order).max(order);
+                            *existing = Write(key.clone(), merged_order);
+                            merged = true;
+                            break;
+                        }
+                        Write(existing_key, existing_order) if *existing_key == key => {
+                            *existing_order = (*existing_order).max(order);
+                            merged = true;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                if !merged {
+                    compact.push(Write(key, order));
+                }
+            }
+        }
+    }
+
+    compact
+}
+
+fn realistic_random_main() -> Workload {
+    let mut rng = DeterministicRng::new(MAINLINE_RANDOM_SEED);
+    let mut jobs = Vec::with_capacity(MAINLINE_RANDOM_JOB_COUNT);
+    let mut layer_jobs = vec![Vec::<usize>::new(); MAINLINE_RANDOM_LAYER_COUNT];
+    let mut shard_recent = vec![Vec::<usize>::new(); MAINLINE_RANDOM_SHARD_COUNT];
+    let mut shard_pipeline_tail = vec![None; MAINLINE_RANDOM_SHARD_COUNT];
+    let mut global_recent = Vec::<usize>::with_capacity(MAINLINE_RANDOM_JOB_COUNT);
+
+    for index in 0..MAINLINE_RANDOM_JOB_COUNT {
+        let layer = index * MAINLINE_RANDOM_LAYER_COUNT / MAINLINE_RANDOM_JOB_COUNT;
+        let shard = rng.index(MAINLINE_RANDOM_SHARD_COUNT);
+        let role = rng.weighted_index(&[28, 24, 16, 14, 12, 6]);
+        let other_shard =
+            (shard + 1 + rng.index(MAINLINE_RANDOM_SHARD_COUNT - 1)) % MAINLINE_RANDOM_SHARD_COUNT;
+
+        let mut dependencies = Vec::with_capacity(5);
+        let mut predecessors = Vec::with_capacity(4);
+
+        let work = match role {
+            0 => {
+                dependencies.push(read_key(
+                    mainline_random_local_resource(&mut rng, shard),
+                    false,
+                ));
+                dependencies.push(read_key(mainline_warm_resource(&mut rng), rng.chance(1, 5)));
+                if rng.chance(1, 3) {
+                    dependencies.push(read_key(
+                        mainline_random_local_resource(&mut rng, shard),
+                        rng.chance(1, 6),
+                    ));
+                }
+                if rng.chance(1, 4) {
+                    dependencies.push(read_key(mainline_hot_resource(&mut rng), false));
+                }
+                if rng.chance(1, 8) {
+                    dependencies.push(write_key(
+                        mainline_random_local_resource(&mut rng, shard),
+                        false,
+                    ));
+                }
+                if rng.chance(3, 10) {
+                    push_previous_layer_predecessor(
+                        &mut predecessors,
+                        &layer_jobs,
+                        layer,
+                        &mut rng,
+                    );
+                }
+                if rng.chance(1, 6) {
+                    push_recent_predecessor(&mut predecessors, &shard_recent[shard], &mut rng);
+                }
+                work_target_us(weighted_duration_us(
+                    &mut rng,
+                    &[(0, 10), (25, 20), (75, 35), (175, 25), (400, 10)],
+                ))
+            }
+            1 => {
+                dependencies.push(read_key(
+                    mainline_random_local_resource(&mut rng, shard),
+                    false,
+                ));
+                dependencies.push(write_key(
+                    mainline_random_local_resource(&mut rng, shard),
+                    rng.chance(2, 5),
+                ));
+                if rng.chance(1, 2) {
+                    dependencies.push(read_key(mainline_warm_resource(&mut rng), rng.chance(1, 4)));
+                }
+                if rng.chance(1, 3) {
+                    dependencies.push(write_key(
+                        mainline_warm_resource(&mut rng),
+                        rng.chance(1, 6),
+                    ));
+                }
+                if rng.chance(3, 5) {
+                    push_previous_layer_predecessor(
+                        &mut predecessors,
+                        &layer_jobs,
+                        layer,
+                        &mut rng,
+                    );
+                }
+                if rng.chance(1, 2) {
+                    push_recent_predecessor(&mut predecessors, &shard_recent[shard], &mut rng);
+                }
+                work_target_us(weighted_duration_us(
+                    &mut rng,
+                    &[(25, 10), (75, 20), (175, 30), (400, 25), (900, 15)],
+                ))
+            }
+            2 => {
+                dependencies.push(read_key(
+                    mainline_random_local_resource(&mut rng, shard),
+                    rng.chance(1, 4),
+                ));
+                dependencies.push(read_key(
+                    mainline_random_local_resource(&mut rng, other_shard),
+                    rng.chance(2, 5),
+                ));
+                dependencies.push(write_key(
+                    mainline_warm_resource(&mut rng),
+                    rng.chance(1, 2),
+                ));
+                if rng.chance(1, 3) {
+                    dependencies.push(read_key(mainline_hot_resource(&mut rng), rng.chance(1, 2)));
+                }
+                if rng.chance(7, 10) {
+                    push_previous_layer_predecessor(
+                        &mut predecessors,
+                        &layer_jobs,
+                        layer,
+                        &mut rng,
+                    );
+                }
+                if rng.chance(3, 5) {
+                    push_recent_predecessor(
+                        &mut predecessors,
+                        &shard_recent[other_shard],
+                        &mut rng,
+                    );
+                }
+                if rng.chance(1, 2) {
+                    push_recent_predecessor(&mut predecessors, &shard_recent[shard], &mut rng);
+                }
+                work_target_us(weighted_duration_us(
+                    &mut rng,
+                    &[
+                        (75, 5),
+                        (175, 15),
+                        (400, 30),
+                        (900, 25),
+                        (1_500, 15),
+                        (2_500, 10),
+                    ],
+                ))
+            }
+            3 => {
+                dependencies.push(write_key(mainline_local_resource(shard, 0), true));
+                dependencies.push(read_key(
+                    mainline_local_resource(
+                        shard,
+                        1 + rng.index(MAINLINE_RANDOM_LOCAL_RESOURCE_COUNT - 1),
+                    ),
+                    rng.chance(1, 2),
+                ));
+                if rng.chance(1, 3) {
+                    dependencies.push(read_key(mainline_warm_resource(&mut rng), true));
+                }
+                if let Some(predecessor) = shard_pipeline_tail[shard] {
+                    predecessors.push(predecessor);
+                } else {
+                    push_previous_layer_predecessor(
+                        &mut predecessors,
+                        &layer_jobs,
+                        layer,
+                        &mut rng,
+                    );
+                }
+                work_target_us(weighted_duration_us(
+                    &mut rng,
+                    &[
+                        (25, 5),
+                        (75, 20),
+                        (175, 30),
+                        (400, 25),
+                        (900, 15),
+                        (1_500, 5),
+                    ],
+                ))
+            }
+            4 => {
+                dependencies.push(read_key(mainline_hot_resource(&mut rng), rng.chance(1, 3)));
+                dependencies.push(write_key(mainline_hot_resource(&mut rng), rng.chance(1, 2)));
+                dependencies.push(read_key(
+                    mainline_random_local_resource(&mut rng, shard),
+                    false,
+                ));
+                if rng.chance(1, 2) {
+                    dependencies.push(write_key(mainline_warm_resource(&mut rng), true));
+                }
+                if rng.chance(3, 5) {
+                    push_previous_layer_predecessor(
+                        &mut predecessors,
+                        &layer_jobs,
+                        layer,
+                        &mut rng,
+                    );
+                }
+                if rng.chance(2, 5) {
+                    push_recent_predecessor(&mut predecessors, &global_recent, &mut rng);
+                }
+                work_target_us(weighted_duration_us(
+                    &mut rng,
+                    &[(0, 20), (25, 20), (75, 20), (175, 20), (400, 15), (900, 5)],
+                ))
+            }
+            _ => {
+                if rng.chance(1, 2) {
+                    dependencies.push(read_key(
+                        mainline_random_local_resource(&mut rng, shard),
+                        false,
+                    ));
+                } else {
+                    dependencies.push(read_key(mainline_warm_resource(&mut rng), false));
+                }
+                if rng.chance(1, 10) {
+                    dependencies.push(write_key(
+                        mainline_random_local_resource(&mut rng, shard),
+                        false,
+                    ));
+                }
+                if rng.chance(1, 5) {
+                    push_previous_layer_predecessor(
+                        &mut predecessors,
+                        &layer_jobs,
+                        layer,
+                        &mut rng,
+                    );
+                }
+                work_target_us(weighted_duration_us(
+                    &mut rng,
+                    &[(0, 40), (25, 30), (75, 20), (175, 10)],
+                ))
+            }
+        };
+
+        if rng.chance(1, 12) {
+            push_recent_predecessor(&mut predecessors, &global_recent, &mut rng);
+        }
+        if rng.chance(1, 10) {
+            dependencies.push(read_key(mainline_warm_resource(&mut rng), true));
+        }
+
+        predecessors.sort_unstable();
+        predecessors.dedup();
+
+        jobs.push(
+            JobSpec::new(work, compact_dependencies(dependencies)).with_predecessors(predecessors),
+        );
+        layer_jobs[layer].push(index);
+        shard_recent[shard].push(index);
+        global_recent.push(index);
+        if role == 3 {
+            shard_pipeline_tail[shard] = Some(index);
+        }
+    }
+
+    Workload::new(
+        "realistic_random_main",
+        format!(
+            "seed{:016x}_res{}_jobs{}_layers{}_us0to2500",
+            MAINLINE_RANDOM_SEED,
+            MAINLINE_RANDOM_RESOURCE_COUNT,
+            MAINLINE_RANDOM_JOB_COUNT,
+            MAINLINE_RANDOM_LAYER_COUNT,
+        ),
+        jobs,
+    )
+}
+
 fn wide_independent(job_count: usize, work: WorkProfile) -> Workload {
     Workload::new(
         "wide_independent",
@@ -1618,15 +2072,12 @@ fn compile_heavy_sparse_keys(job_count: usize) -> Workload {
     )
 }
 
+fn mainline_workloads() -> Vec<Workload> {
+    vec![realistic_random_main()]
+}
+
 fn compile_workloads() -> Vec<Workload> {
-    vec![
-        wide_independent(1_024, WorkProfile::ZERO),
-        hot_key_write_contention(768, WorkProfile::ZERO),
-        layer_barrier_stress(256, 0, 0, 0),
-        fan_out_fan_in(511, 0, 0, 0),
-        mixed_hotspots(96),
-        compile_heavy_sparse_keys(1_536),
-    ]
+    vec![realistic_random_main(), compile_heavy_sparse_keys(1_536)]
 }
 
 fn overhead_workloads() -> Vec<Workload> {
@@ -1740,11 +2191,13 @@ fn bench_adapter<A>(c: &mut Criterion)
 where
     A: BenchAdapter,
 {
+    let mainline = mainline_workloads();
     let compile = compile_workloads();
     let overhead = overhead_workloads();
     let parallelism = parallelism_workloads();
 
     bench_compile::<A>(c, &compile);
+    bench_run_suite::<A>(c, "run_mainline", &mainline, configure_parallelism_group);
     bench_run_suite::<A>(c, "run_overhead", &overhead, configure_overhead_group);
     bench_run_suite::<A>(
         c,
