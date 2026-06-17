@@ -17,6 +17,8 @@ parking_lot = "0.12.5"
 arc-swap = "1.9.1"
 triomphe = { version = "0.1.15", features = ["arc-swap"] }
 bumpalo = "3.20.3"
+crossbeam-utils = "0.8"
+criterion = { version = "0.5", features = ["html_reports"] }
 page_size = "0.6.0"
 
 [package]

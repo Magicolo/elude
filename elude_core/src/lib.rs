@@ -1,4 +1,5 @@
 pub mod memory;
+pub mod simple_memory;
 
 pub trait Table {
     type Store;
@@ -159,7 +160,7 @@ pub mod table {
     ///       single column.
     use crate::schema::Schema;
     use arc_swap::ArcSwapAny;
-    use core::{ptr::NonNull, sync::atomic::Ordering};
+    use core::ptr::NonNull;
     use parking_lot::{Condvar, Mutex};
     use triomphe::ThinArc;
 
@@ -359,7 +360,6 @@ for table in query.tables() {
 }
  */
 
-fn boba() {
-    let a = <Player as Table>::Store::default();
-    let b = a.position.x;
+fn _boba() {
+    let _a = <Player as Table>::Store::default();
 }
