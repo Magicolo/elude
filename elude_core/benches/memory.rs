@@ -1,13 +1,9 @@
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
 use elude_core::memory::Memory;
 
-const CACHE_CAPACITY: usize = 8;
-const BATCH: usize = 4;
+const CACHE_CAPACITY: usize = 64;
+const BATCH: usize = 32;
 
-// ── Fast path: thread-local cache hits ──────────────────────────────
-
-/// Pop and push from the thread-local cache.  Self-balancing: each iteration
-/// pops 8 and pushes 8 back, leaving the cache in the same state.
 fn fast_path_roundtrip(c: &mut Criterion) {
     let mut group = c.benchmark_group("fast_path");
     group.bench_function("roundtrip", |b| {
@@ -33,9 +29,6 @@ fn fast_path_roundtrip(c: &mut Criterion) {
     group.finish();
 }
 
-// ── Slow path: shared pool interactions ──────────────────────────
-
-/// Push one page when the thread cache is full, forcing a flush.
 fn slow_path_flush(c: &mut Criterion) {
     let mut group = c.benchmark_group("slow_path");
     group.bench_function("flush", |b| {
@@ -59,8 +52,6 @@ fn slow_path_flush(c: &mut Criterion) {
     group.finish();
 }
 
-/// Pop from the thread cache when it is empty and the shared pool has pages.
-/// Pops once (triggers refill) then immediately pushes back so no pages leak.
 fn slow_path_refill(c: &mut Criterion) {
     let mut group = c.benchmark_group("slow_path");
     group.bench_function("refill", |b| {
@@ -82,8 +73,6 @@ fn slow_path_refill(c: &mut Criterion) {
     group.finish();
 }
 
-/// Pop when the pool is completely empty — forces an OS allocation.
-/// Immediately pushes back so the page isn't leaked.
 fn slow_path_pop_alloc(c: &mut Criterion) {
     let mut group = c.benchmark_group("slow_path");
     group.bench_function("pop_alloc", |b| {
@@ -99,7 +88,6 @@ fn slow_path_pop_alloc(c: &mut Criterion) {
     group.finish();
 }
 
-/// try_pop on an empty pool — measures the atomic load + null check.
 fn slow_path_try_pop_empty(c: &mut Criterion) {
     let pool = Memory::new();
     c.bench_function("slow_path/try_pop_empty", |b| {
@@ -108,8 +96,6 @@ fn slow_path_try_pop_empty(c: &mut Criterion) {
         })
     });
 }
-
-// ── Batch operations ─────────────────────────────────────────────
 
 fn batch_ops(c: &mut Criterion) {
     let mut group = c.benchmark_group("batch");
@@ -148,11 +134,6 @@ fn batch_ops(c: &mut Criterion) {
     group.finish();
 }
 
-// ── Multi-threaded ───────────────────────────────────────────────
-
-/// Threads do pop → write → push in a loop.  Self-balancing: every page
-/// is returned to the pool, so the total circulating pages stays constant
-/// and no allocations happen during measurement.
 fn concurrent_thrashing(c: &mut Criterion) {
     let mut group = c.benchmark_group("concurrent");
     for &threads in &[2, 4, 8] {
@@ -186,6 +167,38 @@ fn concurrent_thrashing(c: &mut Criterion) {
     group.finish();
 }
 
+fn concurrent_pool_only(c: &mut Criterion) {
+    let mut group = c.benchmark_group("concurrent");
+    for &threads in &[2, 4, 8] {
+        group.bench_function(format!("pool_only/{}t", threads), |b| {
+            b.iter_batched(
+                || {
+                    let pool = Memory::new();
+                    let total = threads * CACHE_CAPACITY * 4;
+                    let pages: Vec<_> =
+                        (0..total).map(|_| unsafe { pool.pop() }).collect();
+                    unsafe { pool.push_batch(&pages) };
+                    pool
+                },
+                |pool| {
+                    std::thread::scope(|s| {
+                        for _ in 0..threads {
+                            s.spawn(|| {
+                                for _ in 0..100 {
+                                    let page = unsafe { pool.pop() };
+                                    unsafe { pool.push(page) };
+                                }
+                            });
+                        }
+                    });
+                },
+                BatchSize::SmallInput,
+            )
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     fast_path_roundtrip,
@@ -195,5 +208,6 @@ criterion_group!(
     slow_path_try_pop_empty,
     batch_ops,
     concurrent_thrashing,
+    concurrent_pool_only,
 );
 criterion_main!(benches);
