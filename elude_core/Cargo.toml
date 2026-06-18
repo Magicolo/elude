@@ -7,7 +7,7 @@ repository.workspace = true
 description.workspace = true
 
 [dependencies]
-crossbeam-utils.workspace = true
+
 parking_lot.workspace = true
 triomphe.workspace = true
 arc-swap.workspace = true

@@ -96,7 +96,7 @@ pub mod schema {
     pub struct Schema(ThinArc<Header, Column>);
 
     pub struct Header {
-        rows: u32,
+        capacity: u32,
     }
 
     #[derive(Clone, Copy)]
@@ -190,11 +190,11 @@ pub mod table {
     ///   Otherwise, if there is a steady stream of readers, `state.read_count`
     ///   may never reach 0, thus never reset `state.read_mask`. If writers
     ///   signal their intent, readers could be able to wait for write
-    ///   resolution. Add another `copies_mask: u64`?
+    ///   resolution. Add another `copy_mask: u64`?
     /// - For each table of a given query:
     ///     - It locks the table state (may try to lock and go for another table
     ///       on failure).
-    ///     - While `state.write_mask & write_mask > 0 || state.copies_mask &
+    ///     - While `state.write_mask & write_mask > 0 || state.copy_mask &
     ///       read_mask > 0`: `header.write.wait()` (or may try another table).
     ///     - It `state.write_mask |= write_mask`
     ///     - It `state.read_mask |= read_mask`
@@ -208,11 +208,11 @@ pub mod table {
     ///     - If `state.read_count == 0`, it `state.read_mask = 0` (read bits
     ///       are only reset when there are no readers left; this is to spare
     ///       needing a counter for each column).
-    ///     - It `state.copies_mask |= write_mask`.
+    ///     - It `state.copy_mask |= write_mask`.
     ///     - While `state.read_mask & write_mask > 0`: `header.read.wait()`.
     ///     - If `write_mask > 0`, the local write buffers are copied into
     ///       storage.
-    ///     - It `state.copies_mask &= ~write_mask`.
+    ///     - It `state.copy_mask &= ~write_mask`.
     ///     - It unlocks the table state.
     ///     - If `read_mask > 0` and has reset `read_count`, it
     ///       `header.read.notify_all()`.
@@ -233,7 +233,7 @@ pub mod table {
     ///         - It updates `state.capacity` and `state.data`.
     ///         - It sets `state.read_mask = u64::MAX` to prevent writers from
     ///           copying to storage.
-    ///         - TODO: Set `state.write_mask` and `state.copies_mask`?
+    ///         - TODO: Set `state.write_mask` and `state.copy_mask`?
     ///         - While `state.read_count > 0`, `header.read.wait()`.
     ///         - It deallocates the old data.
     ///         - It resets `state.read_mask = 0`.
@@ -246,11 +246,15 @@ pub mod table {
     ///       new non-resizable table with the same `state.capacity` as this one
     ///       and insert into it.
     ///
-    /// - ISSUE: The incremental lock protocol can cause deadlocks.
+    /// - ISSUE: The incremental lock protocol can cause deadlocks. Fine if bits
+    ///   are locked in order.
     /// - For batch removals in this table:
     ///     - It locks the state.
     ///     - If `state.write_mask > 0`, `header.write.wait()` and on every wake
-    ///       up, lock all available write bits until they have been all locked.
+    ///       up, lock all available write bits *in order* (if the next bit to
+    ///       be locked is already taken, wait; order prevents deadlocks) until
+    ///       they have been all locked. Also set the corresponding
+    ///       `state.copy_mask` bits to also block readers.
     ///     - While `state.read_count > 0`, `header.read.wait()`.
     ///     - It does all its `swap_remove` operations.
     ///     - It updates `state.count -= removed_count`.
@@ -259,10 +263,10 @@ pub mod table {
     pub struct State {
         count: u32,
         capacity: u32,
-        reads_count: u32,
-        reads_mask: u64,
-        writes_mask: u64,
-        copies_mask: u64,
+        read_count: u32,
+        read_mask: u64,
+        write_mask: u64,
+        copy_mask: u64,
         data: NonNull<u8>,
     }
 

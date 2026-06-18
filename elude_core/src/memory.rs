@@ -5,31 +5,36 @@ use core::{
     ptr::{self, NonNull},
     sync::atomic::{AtomicPtr, AtomicU16, AtomicUsize, Ordering},
 };
-use crossbeam_utils::{Backoff, CachePadded};
 
 // ════════════════════════════════════════════════════════════════════
 // Design
 // ════════════════════════════════════════════════════════════════════
 //
-// Lock-free page pool backed by Treiber stacks.  Each stack node is a
-// page itself: the first 8 bytes store the `next` pointer via
-// `AtomicPtr<u8>` so every access is data-race-free.
+// Work-stealing page pool.  Each thread has a unique pool head (a
+// single Treiber stack) in a global array.  Threads push to and pop
+// from their own head using the LOCAL cache as a hot buffer.
 //
-// `AtomicUsize` is used for the head because a single CAS must update
-// both the pointer and a 16-bit ABA counter — two fields that cannot
-// be packed into `AtomicPtr`.
+// When a thread's LOCAL cache is empty and its own pool head has no
+// pages, it steals from other threads' pool heads before falling back
+// to OS allocation.  The LOCAL cache is the only hot path — the pool
+// heads are only accessed during flush/refill/steal.
 //
-// A per-thread cache (thread-local) avoids atomic ops on the hot path.
-// The shared pool is sharded (N_SHARDS) to reduce CAS contention.
-// Each thread is assigned one shard via a sequential counter; on pop
-// misses the thread probes all shards round-robin starting at its own.
+// There is NO shared sharded pool and NO cache-line padding.  Each
+// pool head is a plain AtomicUsize (8 bytes).  With 64 pool heads
+// the entire array is 512 bytes, and the Memory struct is ~24 bytes.
+//
+// Since stealing is amortized (one steal per cache-miss, which
+// refills 32 pages), contention on any single head is negligible.
+//
+// "A little waste is acceptable" — try_pop only checks LOCAL + own
+// head, never steals.  Stealing only happens on pop() fallback.
 
 // ════════════════════════════════════════════════════════════════════
 // Configuration
 // ════════════════════════════════════════════════════════════════════
 
-/// Number of shared-pool shards (power-of-two for efficient modulo).
-const N_SHARDS: usize = 16;
+/// Maximum number of concurrent threads that can own a pool head.
+const MAX_WORKERS: usize = 64;
 
 /// Per-thread local cache capacity.
 const CACHE_CAPACITY: usize = 64;
@@ -68,7 +73,7 @@ fn pack_next(word: usize, new_ptr: *mut u8) -> usize {
 }
 
 // ════════════════════════════════════════════════════════════════════
-// Thread-local page cache
+// Thread-local cache
 // ════════════════════════════════════════════════════════════════════
 
 struct LocalCache {
@@ -126,39 +131,57 @@ thread_local! {
         const { UnsafeCell::new(LocalCache::new()) };
 }
 
-/// Global atomic counter used to assign each thread a unique shard on first access.
-static SHARD_COUNTER: AtomicU16 = AtomicU16::new(0);
+/// Global atomic counter used to assign each thread a unique pool head.
+static NEXT_WORKER: AtomicU16 = AtomicU16::new(0);
 
 thread_local! {
-    static SHARD: usize = SHARD_COUNTER.fetch_add(1, Ordering::Relaxed) as usize % N_SHARDS;
+    static WORKER_ID: usize = NEXT_WORKER.fetch_add(1, Ordering::Relaxed) as usize % MAX_WORKERS;
 }
 
 // ════════════════════════════════════════════════════════════════════
-// Memory pool — sharded, cache-line padded
+// Memory pool — per-thread Treiber stacks, no padding
 // ════════════════════════════════════════════════════════════════════
 
 pub struct Memory {
-    shards: [CachePadded<AtomicUsize>; N_SHARDS],
+    pool_heads: Box<[AtomicUsize; MAX_WORKERS]>,
     layout: Layout,
 }
 
 impl Memory {
-    #[inline]
-    fn shard(&self, idx: usize) -> &CachePadded<AtomicUsize> {
-        &self.shards[idx]
-    }
-
     pub fn new() -> Self {
         let page_size = page_size::get();
         let layout = Layout::from_size_align(page_size, page_size)
             .expect("page size is a power of two and non-zero");
         Self {
-            shards: array::from_fn(|_| CachePadded::new(AtomicUsize::new(0))),
+            pool_heads: Box::new(array::from_fn(|_| AtomicUsize::new(0))),
             layout,
         }
     }
 
     // ── Public API ─────────────────────────────────────────────────
+
+    /// Drain the current thread's entire LOCAL cache into its own pool head.
+    /// Needed before dropping a `Memory` that was used by other threads,
+    /// because `Drop` only cleans up the calling thread's cache.
+    pub unsafe fn flush_all(&self) {
+        unsafe {
+            let mut pages: [NonNull<usize>; CACHE_CAPACITY] =
+                [NonNull::dangling(); CACHE_CAPACITY];
+            let mut count = 0usize;
+            LOCAL.with(|local| {
+                let cache = &mut *local.get();
+                loop {
+                    let p = cache.pop();
+                    if p.is_null() {
+                        break;
+                    }
+                    pages[count] = NonNull::new_unchecked(p).cast::<usize>();
+                    count += 1;
+                }
+            });
+            self.push_batch(&pages[..count]);
+        }
+    }
 
     #[inline]
     pub unsafe fn push(&self, page: NonNull<usize>) {
@@ -181,7 +204,9 @@ impl Memory {
                 return Some(NonNull::new_unchecked(page).cast::<usize>());
             }
 
-            self.refill()
+            // Own pool head only — "a little waste is acceptable."
+            let id = WORKER_ID.with(|&id| id);
+            self.refill_from_head(id)
         }
     }
 
@@ -192,64 +217,51 @@ impl Memory {
                 return page;
             }
 
-            let mut alloc_batch = [core::ptr::null_mut::<u8>(); BATCH];
-            for page in &mut alloc_batch {
-                let ptr = std::alloc::alloc(self.layout);
-                if ptr.is_null() {
-                    std::alloc::handle_alloc_error(self.layout);
+            // try_pop missed → steal from other workers' pool heads.
+            let my_id = WORKER_ID.with(|&id| id);
+            for offset in 1..MAX_WORKERS {
+                let id = (my_id + offset) % MAX_WORKERS;
+                if let Some(page) = self.refill_from_head(id) {
+                    return page;
                 }
-                *page = ptr;
             }
 
-            LOCAL.with(|local| {
-                let cache = &mut *local.get();
-                for &p in &alloc_batch[1..] {
-                    cache.push(p);
-                }
-            });
-
-            NonNull::new_unchecked(alloc_batch[0]).cast::<usize>()
+            // Everyone is empty — fresh-allocate.
+            self.alloc_batch()
         }
     }
 
-    // ── Batch flush (cache -> shared pool) ─────────────────────────
+    // ── Batch flush (cache → own pool head) ────────────────────────
 
     unsafe fn flush(&self, extra: *mut u8) {
         unsafe {
             LOCAL.with(|local| {
                 let cache = &mut *local.get();
-
-                let drain_max = CACHE_CAPACITY / 2;
-                let batch = cache.drain(drain_max);
+                let batch = cache.drain(BATCH);
                 let count = batch.len();
 
-                let shard = self.shard(SHARD.with(|&s| s));
-                let backoff = Backoff::new();
+                let id = WORKER_ID.with(|&id| id);
+                let head = &self.pool_heads[id];
+                let mut backoff = Backoff::new();
 
-                let mut linked = false;
-                let mut prev_linked_head: *mut u8 = ptr::null_mut();
                 loop {
-                    let head = shard.load(Ordering::Relaxed);
-                    let head_ptr = unpack_ptr(head);
+                    let head_word = head.load(Ordering::Relaxed);
+                    let head_ptr = unpack_ptr(head_word);
 
-                    if !linked || head_ptr != prev_linked_head {
-                        let mut prev = head_ptr;
-                        for &current in batch[..count].iter().rev() {
-                            let current_next = &*(current.cast::<AtomicPtr<u8>>());
-                            current_next.store(prev, Ordering::Relaxed);
-                            prev = current;
-                        }
-                        let extra_next = &*(extra.cast::<AtomicPtr<u8>>());
-                        extra_next.store(prev, Ordering::Relaxed);
-                        linked = true;
-                        prev_linked_head = head_ptr;
+                    let mut prev = head_ptr;
+                    for &current in batch[..count].iter().rev() {
+                        let current_next = &*(current.cast::<AtomicPtr<u8>>());
+                        current_next.store(prev, Ordering::Relaxed);
+                        prev = current;
                     }
+                    let extra_next = &*(extra.cast::<AtomicPtr<u8>>());
+                    extra_next.store(prev, Ordering::Relaxed);
 
-                    let new = pack_next(head, extra);
+                    let new = pack_next(head_word, extra);
 
-                    if shard
+                    if head
                         .compare_exchange_weak(
-                            head,
+                            head_word,
                             new,
                             Ordering::Release,
                             Ordering::Relaxed,
@@ -265,30 +277,15 @@ impl Memory {
         }
     }
 
-    // ── Batch refill (shared pool -> cache) ─────────────────────────
+    // ── Refill from a specific pool head ───────────────────────────
 
-    /// Probe shards round-robin starting at the calling thread's shard.
-    #[cold]
-    unsafe fn refill(&self) -> Option<NonNull<usize>> {
+    unsafe fn refill_from_head(&self, id: usize) -> Option<NonNull<usize>> {
         unsafe {
-            let my_shard = SHARD.with(|&s| s);
-            for offset in 0..N_SHARDS {
-                let shard_idx = (my_shard + offset) % N_SHARDS;
-                if let Some(page) = self.refill_from_shard(shard_idx) {
-                    return Some(page);
-                }
-            }
-            None
-        }
-    }
-
-    unsafe fn refill_from_shard(&self, shard_idx: usize) -> Option<NonNull<usize>> {
-        unsafe {
-            let shard = self.shard(shard_idx);
-            let backoff = Backoff::new();
+            let head = &self.pool_heads[id];
+            let mut backoff = Backoff::new();
             loop {
-                let head = shard.load(Ordering::Acquire);
-                let head_ptr = unpack_ptr(head);
+                let head_word = head.load(Ordering::Acquire);
+                let head_ptr = unpack_ptr(head_word);
                 if head_ptr.is_null() {
                     return None;
                 }
@@ -314,11 +311,11 @@ impl Memory {
                     tail_next_atomic.load(Ordering::Relaxed)
                 };
 
-                let new = pack_next(head, tail_next);
+                let new = pack_next(head_word, tail_next);
 
-                if shard
+                if head
                     .compare_exchange_weak(
-                        head,
+                        head_word,
                         new,
                         Ordering::Acquire,
                         Ordering::Relaxed,
@@ -339,37 +336,61 @@ impl Memory {
         }
     }
 
-    // ── Direct batch operations ─────────────────────────────────────
+    // ── OS batch allocation ────────────────────────────────────────
+
+    unsafe fn alloc_batch(&self) -> NonNull<usize> {
+        unsafe {
+            let mut batch = [core::ptr::null_mut::<u8>(); BATCH];
+            for page in &mut batch {
+                let ptr = std::alloc::alloc(self.layout);
+                if ptr.is_null() {
+                    std::alloc::handle_alloc_error(self.layout);
+                }
+                *page = ptr;
+            }
+
+            LOCAL.with(|local| {
+                let cache = &mut *local.get();
+                for &p in &batch[1..] {
+                    cache.push(p);
+                }
+            });
+
+            NonNull::new_unchecked(batch[0]).cast::<usize>()
+        }
+    }
+
+    // ── Direct batch operations ────────────────────────────────────
 
     #[allow(dead_code)]
     pub unsafe fn pop_batch(&self, out: &mut [NonNull<usize>], max: usize) -> usize {
         unsafe {
-            let my_shard = SHARD.with(|&s| s);
+            let my_id = WORKER_ID.with(|&id| id);
             let mut total = 0usize;
-            for offset in 0..N_SHARDS {
+            for offset in 0..MAX_WORKERS {
                 if total >= max {
                     break;
                 }
-                let shard_idx = (my_shard + offset) % N_SHARDS;
-                let n = self.pop_batch_from_shard(shard_idx, &mut out[total..], max - total);
+                let id = (my_id + offset) % MAX_WORKERS;
+                let n = self.pop_batch_from_head(id, &mut out[total..], max - total);
                 total += n;
             }
             total
         }
     }
 
-    unsafe fn pop_batch_from_shard(
+    unsafe fn pop_batch_from_head(
         &self,
-        shard_idx: usize,
+        id: usize,
         out: &mut [NonNull<usize>],
         max: usize,
     ) -> usize {
         unsafe {
-            let shard = self.shard(shard_idx);
-            let backoff = Backoff::new();
+            let head = &self.pool_heads[id];
+            let mut backoff = Backoff::new();
             loop {
-                let head = shard.load(Ordering::Acquire);
-                let head_ptr = unpack_ptr(head);
+                let head_word = head.load(Ordering::Acquire);
+                let head_ptr = unpack_ptr(head_word);
                 if head_ptr.is_null() {
                     return 0;
                 }
@@ -390,11 +411,11 @@ impl Memory {
                     let tail_atomic = &*(current.cast::<AtomicPtr<u8>>());
                     tail_atomic.load(Ordering::Relaxed)
                 };
-                let new = pack_next(head, tail_next);
+                let new = pack_next(head_word, tail_next);
 
-                if shard
+                if head
                     .compare_exchange_weak(
-                        head,
+                        head_word,
                         new,
                         Ordering::Acquire,
                         Ordering::Relaxed,
@@ -423,33 +444,28 @@ impl Memory {
                 return;
             }
 
-            let shard = self.shard(SHARD.with(|&s| s));
-            let backoff = Backoff::new();
+            let id = WORKER_ID.with(|&id| id);
+            let head = &self.pool_heads[id];
+            let mut backoff = Backoff::new();
 
-            let mut linked = false;
-            let mut prev_linked_head: *mut u8 = ptr::null_mut();
             loop {
-                let head = shard.load(Ordering::Relaxed);
-                let head_ptr = unpack_ptr(head);
+                let head_word = head.load(Ordering::Relaxed);
+                let head_ptr = unpack_ptr(head_word);
 
-                if !linked || head_ptr != prev_linked_head {
-                    let mut prev = head_ptr;
-                    for &page in pages.iter().rev() {
-                        let current_page = page.cast::<u8>().as_ptr();
-                        let current_next = &*(current_page.cast::<AtomicPtr<u8>>());
-                        current_next.store(prev, Ordering::Relaxed);
-                        prev = current_page;
-                    }
-                    linked = true;
-                    prev_linked_head = head_ptr;
+                let mut prev = head_ptr;
+                for &page in pages.iter().rev() {
+                    let current_page = page.cast::<u8>().as_ptr();
+                    let current_next = &*(current_page.cast::<AtomicPtr<u8>>());
+                    current_next.store(prev, Ordering::Relaxed);
+                    prev = current_page;
                 }
 
                 let first = pages[0].cast::<u8>().as_ptr();
-                let new = pack_next(head, first);
+                let new = pack_next(head_word, first);
 
-                if shard
+                if head
                     .compare_exchange_weak(
-                        head,
+                        head_word,
                         new,
                         Ordering::Release,
                         Ordering::Relaxed,
@@ -479,9 +495,9 @@ impl Drop for Memory {
                 }
             });
 
-            for shard in &self.shards {
-                let head = shard.load(Ordering::Relaxed);
-                let mut ptr = unpack_ptr(head);
+            for head in self.pool_heads.iter() {
+                let word = head.load(Ordering::Relaxed);
+                let mut ptr = unpack_ptr(word);
                 while !ptr.is_null() {
                     let next = {
                         let next_atomic = &*(ptr.cast::<AtomicPtr<u8>>());
@@ -495,6 +511,34 @@ impl Drop for Memory {
     }
 }
 
+// ── Backoff re-implementation ──────────────────────────────────────
+// Simple inline backoff to avoid pulling in crossbeam_utils for this.
+// Same behavior: spins with PAUSE then yields after SPIN_LIMIT.
+
+const SPIN_LIMIT: u32 = 8;
+
+struct Backoff {
+    step: u32,
+}
+
+impl Backoff {
+    fn new() -> Self {
+        Self { step: 0 }
+    }
+
+    #[inline]
+    fn snooze(&mut self) {
+        if self.step <= SPIN_LIMIT {
+            for _ in 0..1 << self.step {
+                core::hint::spin_loop();
+            }
+            self.step += 1;
+        } else {
+            std::thread::yield_now();
+        }
+    }
+}
+
 // ════════════════════════════════════════════════════════════════════
 // Tests
 // ════════════════════════════════════════════════════════════════════
@@ -504,7 +548,6 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    /// Thread-safe page handle for crossing Send-bound thread boundaries.
     #[derive(Clone, Copy)]
     struct Page(NonNull<usize>);
     unsafe impl Send for Page {}
@@ -540,8 +583,6 @@ mod tests {
         unsafe { pool.push(page) };
     }
 
-    // ── Single-threaded edge cases ─────────────────────────────────────
-
     #[test]
     fn try_pop_returns_none_when_truly_empty() {
         let pool = Memory::new();
@@ -549,11 +590,9 @@ mod tests {
     }
 
     #[test]
-    fn try_pop_finds_pages_in_shard_after_push_batch() {
+    fn try_pop_finds_pages_in_head_after_push_batch() {
         let pool = Memory::new();
         let p = unsafe { pool.pop() };
-        // Drain the LOCAL cache so try_pop must go to the shard.
-        // Collect cached pages and return them to avoid leak.
         let mut cached = Vec::new();
         while let Some(c) = unsafe { pool.try_pop() } {
             cached.push(c);
@@ -562,14 +601,12 @@ mod tests {
             unsafe { pool.push_batch(&[*c]) };
         }
         unsafe { pool.push_batch(&[p]) };
-        let p2 = unsafe { pool.try_pop() }.expect("should find page in shard");
+        let p2 = unsafe { pool.try_pop() }.expect("should find page in own head");
         assert_eq!(p, p2);
     }
 
     #[test]
     fn pop_allocates_batch_on_empty_pool() {
-        // P2: pop() allocates BATCH pages from OS and caches BATCH-1.
-        // So BATCH sequential pops should all succeed without allocating.
         let pool = Memory::new();
         let mut pages = Vec::new();
         for _ in 0..BATCH {
@@ -584,18 +621,14 @@ mod tests {
     #[test]
     fn cache_hit_after_partial_drain() {
         let pool = Memory::new();
-        // Pop BATCH pages — first pop allocates, caches BATCH-1
         let mut pages = Vec::new();
         for _ in 0..BATCH {
             pages.push(unsafe { pool.pop() });
         }
-        // Push one back (goes to cache)
         let p = pages.pop().unwrap();
         unsafe { pool.push(p) };
-        // try_pop should find it in cache (no CAS)
         let p2 = unsafe { pool.try_pop() }.expect("should hit cache");
         assert_eq!(p, p2);
-        // Return remaining
         for p in pages {
             unsafe { pool.push(p) };
         }
@@ -604,23 +637,18 @@ mod tests {
     #[test]
     fn push_flushes_on_overflow() {
         let pool = Memory::new();
-        // Pop BATCH pages to fill cache partway
         let mut pages = Vec::new();
         for _ in 0..BATCH {
             pages.push(unsafe { pool.pop() });
         }
-        // Push CACHE_CAPACITY pages — cache overflows, flushes CACHE/2 to shard
         let mut extra = Vec::new();
         for _ in 0..CACHE_CAPACITY {
             let p = unsafe { pool.pop() };
             extra.push(p);
             unsafe { pool.push(p) };
         }
-        // try_pop should still find pages (cache was replenished during flush via
-        // the returned pages consumption order, but the key is no crash)
         let found = unsafe { pool.try_pop() };
         assert!(found.is_some());
-
         for p in pages {
             unsafe { pool.push(p) };
         }
@@ -629,7 +657,6 @@ mod tests {
     #[test]
     fn push_many_triggers_multiple_flushes() {
         let pool = Memory::new();
-        // Pop pages, then push 3× CACHE_CAPACITY → triggers multiple flushes
         let mut pages = Vec::new();
         for _ in 0..3 * CACHE_CAPACITY {
             pages.push(unsafe { pool.pop() });
@@ -637,12 +664,8 @@ mod tests {
         for p in &pages {
             unsafe { pool.push(*p) };
         }
-        // All pages are now back in the pool (cache + shards)
         for _ in pages {
             let popped = unsafe { pool.try_pop() }.expect("should recover page");
-            // Silently drop — we've verified we can recover, the Drop impl will dealloc
-            // But wait, Drop only frees what's in the pool, not held refs -> leak.
-            // So we need to push it back instead.
             unsafe { pool.push(popped) };
         }
     }
@@ -726,13 +749,11 @@ mod tests {
         let pages: Vec<_> = (0..n_pages).map(|_| unsafe { pool.pop() }).collect();
         unsafe { pool.push_batch(&pages) };
 
-        // Pop with a 3-page buffer even though 6 are available
         let mut out = [NonNull::<usize>::dangling(); 3];
         let n = unsafe { pool.pop_batch(&mut out, 3) };
         assert_eq!(n, 3);
         let mut recovered = out[..n].to_vec();
 
-        // Empty the rest
         let mut out2 = [NonNull::<usize>::dangling(); 3];
         let n2 = unsafe { pool.pop_batch(&mut out2, 3) };
         assert_eq!(n2, 3);
@@ -751,16 +772,13 @@ mod tests {
         let pages: Vec<_> = (0..3).map(|_| unsafe { pool.pop() }).collect();
         unsafe { pool.push_batch(&pages) };
 
-        // Request 5 but only 3 available
         let mut out = [NonNull::<usize>::dangling(); 5];
         let n = unsafe { pool.pop_batch(&mut out, 5) };
         assert_eq!(n, 3);
 
-        // Remaining pop should return 0
         let n2 = unsafe { pool.pop_batch(&mut out, 1) };
         assert_eq!(n2, 0);
 
-        // Return pages
         for &p in &out[..n] {
             unsafe { pool.push(p) };
         }
@@ -768,7 +786,6 @@ mod tests {
 
     #[test]
     fn push_batch_large() {
-        // Push more pages than BATCH to exercise chain relink
         let pool = Memory::new();
         let count = BATCH + 5;
         let pages: Vec<_> = (0..count).map(|_| unsafe { pool.pop() }).collect();
@@ -791,7 +808,6 @@ mod tests {
     fn concurrent_push_pop_simple() {
         let pool = Memory::new();
         let n_threads = 4;
-        // Prime pool with pages
         let mut seed_pages = Vec::new();
         for _ in 0..n_threads * 10 {
             seed_pages.push(unsafe { pool.pop() });
@@ -831,8 +847,6 @@ mod tests {
             }
         });
 
-        // Verify at least some pages are recoverable (exact count depends on
-        // SHARD assignment relative to prior tests).
         let mut total = 0;
         loop {
             let mut out = [NonNull::<usize>::dangling(); 16];
@@ -855,14 +869,12 @@ mod tests {
         let per_thread = 15;
         let total = n_threads * per_thread;
 
-        // Pre-populate pool
         let mut all_pages = Vec::new();
         for _ in 0..total {
             all_pages.push(unsafe { pool.pop() });
         }
         unsafe { pool.push_batch(&all_pages) };
 
-        // Each thread pops pages — Page is Send so crossing thread boundary is safe.
         let handle_pages: Vec<Vec<Page>> = std::thread::scope(|s| {
             let mut handles = Vec::new();
             for _ in 0..n_threads {
@@ -901,7 +913,6 @@ mod tests {
                         held.push(page);
 
                         if i % 5 == 4 {
-                            // Every 5 ops, batch-push half of held
                             let mid = held.len() / 2;
                             let batch: Vec<_> = held.drain(..mid).collect();
                             unsafe { pool.push_batch(&batch) };
@@ -921,7 +932,6 @@ mod tests {
         let n_threads = 8;
         let ops_per_thread = 100;
 
-        // Prime with enough pages
         let mut seed = Vec::new();
         for _ in 0..n_threads * 8 {
             seed.push(unsafe { pool.pop() });
@@ -935,7 +945,6 @@ mod tests {
                 s.spawn(|| {
                     for _ in 0..ops_per_thread {
                         let page = unsafe { pool.pop() };
-                        // Touch the page
                         unsafe { *(page.cast::<u8>().as_ptr()) = 0xFF };
                         unsafe { pool.push(page) };
                     }
@@ -949,7 +958,6 @@ mod tests {
         let pool = Memory::new();
         let pages_a: Vec<Page> = (0..10).map(|_| unsafe { Page::from_pool(&pool) }).collect();
 
-        // Thread A pushes
         std::thread::scope(|s| {
             s.spawn(|| {
                 for p in pages_a {
@@ -958,7 +966,6 @@ mod tests {
             });
         });
 
-        // Thread B pops
         let pages_b: Vec<Page> = std::thread::scope(|s| {
             s.spawn(|| {
                 let mut pages = Vec::new();
@@ -973,7 +980,6 @@ mod tests {
 
         assert_eq!(pages_b.len(), 10);
 
-        // Return via another thread
         std::thread::scope(|s| {
             s.spawn(|| {
                 for p in pages_b {
@@ -984,7 +990,7 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_batch_push_pop_multi_shard() {
+    fn concurrent_batch_push_pop_multi_worker() {
         let pool = Memory::new();
         let n_threads = 4;
         let n_pages = 8;
@@ -1021,15 +1027,12 @@ mod tests {
         let pages: Vec<_> = (0..count).map(|_| unsafe { pool.pop() }).collect();
         assert_eq!(pages.len(), count);
 
-        // Push to shards via push_batch (bypasses cache) — pages are now in shard only.
         unsafe { pool.push_batch(&pages) };
 
-        // Pop them back via pop_batch (bypasses cache)
         let mut out = vec![NonNull::<usize>::dangling(); count];
         let n = unsafe { pool.pop_batch(&mut out, count) };
         assert_eq!(n, count);
 
-        // Verify no duplicates
         let unique: HashSet<_> = out[..n].iter().map(|p| p.as_ptr()).collect();
         assert_eq!(unique.len(), count);
 
@@ -1040,21 +1043,17 @@ mod tests {
 
     #[test]
     fn all_pages_accounted_for_invariants() {
-        // Pop N pages, push them back. All original pages must be recovered
-        // (batch allocation may add extra cached pages beyond N).
         let pool = Memory::new();
         let n = 73;
         let pages: Vec<_> = (0..n).map(|_| unsafe { pool.pop() }).collect();
         assert_eq!(pages.len(), n);
 
-        // Push via mixed methods
         let mid = n / 3;
         unsafe { pool.push_batch(&pages[..mid]) };
         for &p in &pages[mid..] {
             unsafe { pool.push(p) };
         }
 
-        // Recover all via combined methods
         let mut recovered = Vec::new();
         loop {
             let mut out = [NonNull::<usize>::dangling(); 16];
@@ -1068,7 +1067,6 @@ mod tests {
             recovered.push(p);
         }
 
-        // Every original page must be present somewhere in recovered set
         let recovered_set: HashSet<_> = recovered.iter().map(|p| p.as_ptr()).collect();
         for p in &pages {
             assert!(
@@ -1085,18 +1083,15 @@ mod tests {
 
     #[test]
     fn drop_does_not_panic() {
-        // Memory::drop must cleanly walk and dealloc all pages in shards + cache
         let pool = Memory::new();
         let mut pages = Vec::new();
         for _ in 0..30 {
             pages.push(unsafe { pool.pop() });
         }
-        // Mix of pages in cache and shards
         for p in &pages[..10] {
             unsafe { pool.push(*p) };
         }
         unsafe { pool.push_batch(&pages[10..]) };
-        // Drop will dealloc the 10 in cache + 20 in shards
         drop(pool);
     }
 
@@ -1136,12 +1131,10 @@ mod tests {
     // ── Batch correctness ──────────────────────────────────────────────
 
     #[test]
-    fn batch_push_then_pop_all_shards() {
-        // Push enough pages across push_batch calls so every shard gets some.
-        // Verify pop_batch drains all shards completely.
+    fn batch_push_then_pop_all_workers() {
         let pool = Memory::new();
         let pages_per_call = 4;
-        let calls = N_SHARDS * 2;
+        let calls = 8;
         let all_pages: Vec<_> = (0..pages_per_call * calls)
             .map(|_| unsafe { pool.pop() })
             .collect();
@@ -1153,7 +1146,6 @@ mod tests {
             offset += pages_per_call;
         }
 
-        // Drain all shards
         let mut recovered = Vec::new();
         loop {
             let mut out = [NonNull::<usize>::dangling(); 16];
@@ -1173,9 +1165,8 @@ mod tests {
     }
 
     #[test]
-    fn batch_pop_between_shards_no_loss() {
+    fn batch_pop_between_workers_no_loss() {
         let pool = Memory::new();
-        // Allocate pages via OS directly (pop_batch won't alloc, pop triggers cache)
         unsafe {
             let layout = Layout::from_size_align(page_size::get(), page_size::get()).unwrap();
             let n_pages = 23;
@@ -1186,10 +1177,8 @@ mod tests {
                 pages.push(NonNull::new_unchecked(ptr).cast::<usize>());
             }
 
-            // push_batch to shards
             pool.push_batch(&pages);
 
-            // pop_batch in small 5-page batches to exhaust shards
             let mut total = 0;
             loop {
                 let mut out = [NonNull::<usize>::dangling(); 5];
@@ -1198,7 +1187,6 @@ mod tests {
                     break;
                 }
                 total += n;
-                // Immediately free each page to avoid leaking
                 for &p in &out[..n] {
                     std::alloc::dealloc(p.cast::<u8>().as_ptr(), layout);
                 }
@@ -1240,7 +1228,6 @@ mod tests {
     fn stress_massive_alloc_free() {
         let pool = Memory::new();
         let n_pages = 500;
-        // Allocate and free repeatedly
         for _ in 0..5 {
             let pages: Vec<_> = (0..n_pages).map(|_| unsafe { pool.pop() }).collect();
             for p in &pages {
@@ -1258,7 +1245,6 @@ mod tests {
         let mut held = Vec::new();
         for i in 0..200 {
             if i % 3 == 0 && !held.is_empty() {
-                // Return a batch
                 let n = held.len().min(4);
                 let batch: Vec<_> = held.drain(..n).collect();
                 unsafe { pool.push_batch(&batch) };
@@ -1276,13 +1262,11 @@ mod tests {
     #[test]
     fn stress_cache_boundary_ping_pong() {
         let pool = Memory::new();
-        // Pre-populate with enough pages to stay in cache
         let seeds: Vec<_> = (0..CACHE_CAPACITY).map(|_| unsafe { pool.pop() }).collect();
         for p in &seeds {
             unsafe { pool.push(*p) };
         }
 
-        // Ping-pong: pop CACHE_CAPACITY pages, push them back, repeat
         for _ in 0..10 {
             let mut pages = Vec::new();
             for _ in 0..CACHE_CAPACITY {

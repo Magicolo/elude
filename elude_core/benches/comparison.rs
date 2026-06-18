@@ -2,8 +2,8 @@ use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion
 use elude_core::{memory::Memory, simple_memory::SimpleMemory};
 use core::ptr::NonNull;
 
-const CACHE_CAPACITY: usize = 8;
-const BATCH: usize = 4;
+const CACHE_CAPACITY: usize = 64;
+const BATCH: usize = 32;
 
 // ════════════════════════════════════════════════════════════════════
 // Fast path: thread-local (lock-free) vs mutex

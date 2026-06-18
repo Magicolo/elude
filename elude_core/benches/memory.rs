@@ -156,6 +156,7 @@ fn concurrent_thrashing(c: &mut Criterion) {
                                     unsafe { *(page.cast::<u8>().as_ptr()) = 0xAB };
                                     unsafe { pool.push(page) };
                                 }
+                                unsafe { pool.flush_all() };
                             });
                         }
                     });
@@ -188,6 +189,7 @@ fn concurrent_pool_only(c: &mut Criterion) {
                                     let page = unsafe { pool.pop() };
                                     unsafe { pool.push(page) };
                                 }
+                                unsafe { pool.flush_all() };
                             });
                         }
                     });
