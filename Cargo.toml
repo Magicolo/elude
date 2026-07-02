@@ -1,9 +1,6 @@
 [workspace]
 resolver = "2"
-members = [
-    "elude_core",
-    "elude_macro",
-]
+members = ["elude_core", "elude_macro"]
 
 [workspace.package]
 version = "0.1.0"
@@ -13,12 +10,13 @@ repository = "https://github.com/magicolo/elude"
 description = ""
 
 [workspace.dependencies]
-parking_lot = "0.12.5"
 arc-swap = "1.9.1"
-triomphe = { version = "0.1.15", features = ["arc-swap"] }
 bumpalo = "3.20.3"
+cache_line_size = "1.0.0"
 criterion = { version = "0.5", features = ["html_reports"] }
 page_size = "0.6.0"
+parking_lot = "0.12.5"
+triomphe = { version = "0.1.15", features = ["arc-swap"] }
 
 [package]
 name = "elude"
