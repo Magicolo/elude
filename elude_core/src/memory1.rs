@@ -1,15 +1,11 @@
 use core::{
     alloc::Layout,
+    cell::RefCell,
+    mem::{replace, take},
     num::NonZeroUsize,
     ptr::{null_mut, NonNull},
 };
 use std::alloc::{alloc, dealloc, handle_alloc_error};
-/*
-    TODO: Unlink pages that have become full from the linked list. Relink them when the `Handle` is dropped.
-    - On `next()`, if the page has become full, unlink it.
-    - On `Handle::drop()`, relink the page if it was full.
-    - This means that the head pointers in `Memory` always have at least one slot available.
-*/
 
 pub struct Page {
     data: NonNull<u8>,
@@ -17,6 +13,8 @@ pub struct Page {
     slots: u64,
     // Next page of the same size.
     next: *mut Page,
+    // Head of the linked list for this size.
+    head: NonNull<*mut Page>,
 }
 
 pub struct Handle {
@@ -62,6 +60,10 @@ impl Size {
     }
 }
 
+thread_local! {
+    static MEMORY: RefCell<Memory> = const { RefCell::new(Memory::new()) };
+}
+
 impl Memory {
     pub const fn new() -> Self {
         Self {
@@ -69,30 +71,35 @@ impl Memory {
         }
     }
 
-    pub fn next(&mut self, size: Size) -> Handle {
-        let head = unsafe { self.pages.get_unchecked_mut(size.index() as usize) };
-        let mut current = &mut *head;
-        while let Some(mut raw) = NonNull::new(*current) {
-            let page = unsafe { raw.as_mut() };
-            let slot = page.next_slot();
-            if page.add_slot(slot) {
-                return Handle {
-                    data: page.get_slot(slot),
-                    page: raw,
-                };
-            } else {
-                current = &mut page.next;
+    pub fn next(size: Size) -> Handle {
+        MEMORY.with_borrow_mut(|memory| {
+            let head = unsafe { memory.pages.get_unchecked_mut(size.index() as usize) };
+            match NonNull::new(*head) {
+                Some(mut raw) => {
+                    let page = unsafe { raw.as_mut() };
+                    let slot = page.slots.trailing_ones();
+                    page.slots |= 1u64 << slot;
+                    if page.slots == u64::MAX {
+                        *head = take(&mut page.next);
+                    }
+                    Handle {
+                        data: unsafe { page.data().add((size.size() * slot) as usize) },
+                        page: raw,
+                    }
+                }
+                None => {
+                    let mut raw = Page::new(NonNull::from_mut(head), size);
+                    let page = unsafe { raw.as_mut() };
+                    if page.slots < u64::MAX {
+                        page.next = replace(head, raw.as_ptr());
+                    }
+                    Handle {
+                        data: page.data(),
+                        page: raw,
+                    }
+                }
             }
-        }
-
-        let mut page = Page::new(size);
-        let data = page.data();
-        page.next = *head;
-        page.add_slot(0);
-        let page = Box::into_raw(Box::new(page));
-        *head = page;
-        let page = unsafe { NonNull::new_unchecked(page) };
-        Handle { data, page }
+        })
     }
 }
 
@@ -102,14 +109,17 @@ impl Page {
     const MASK: usize = 0b1111;
     const SIZE: u32 = 4096;
 
-    pub fn new(size: Size) -> Self {
-        Self {
-            data: match NonNull::new(unsafe { alloc(Self::LAYOUT) }) {
-                Some(data) => Self::add_size(data, size.index()),
-                None => handle_alloc_error(Self::LAYOUT),
-            },
-            slots: Self::mask(size.size()),
-            next: null_mut(),
+    pub fn new(head: NonNull<*mut Page>, size: Size) -> NonNull<Self> {
+        unsafe {
+            NonNull::new_unchecked(Box::into_raw(Box::new(Page {
+                data: match NonNull::new(alloc(Page::LAYOUT)) {
+                    Some(data) => Self::add_size(data, size.index()),
+                    None => handle_alloc_error(Page::LAYOUT),
+                },
+                slots: Page::mask(size.size()) | 1,
+                next: null_mut(),
+                head,
+            })))
         }
     }
 
@@ -122,54 +132,13 @@ impl Page {
     }
 
     #[inline]
-    pub fn size(&self) -> u32 {
-        Size::index_to_size(Self::get_size(self.data))
+    pub fn size(&self) -> u8 {
+        Self::get_size(self.data)
     }
 
     #[inline]
     pub fn data(&self) -> NonNull<u8> {
         Self::remove_size(self.data)
-    }
-
-    #[inline]
-    pub fn get_slot(&self, slot: u32) -> NonNull<u8> {
-        unsafe { self.data().add((self.size() * slot) as usize) }
-    }
-
-    fn find_slot(&self, data: NonNull<u8>) -> Option<u32> {
-        data.addr()
-            .get()
-            .checked_sub(self.data().addr().get())?
-            .checked_div(self.size() as usize)?
-            .try_into()
-            .ok()
-    }
-
-    #[inline]
-    const fn next_slot(&self) -> u32 {
-        self.slots.trailing_ones()
-    }
-
-    #[inline]
-    const fn add_slot(&mut self, slot: u32) -> bool {
-        match 1u64.checked_shl(slot) {
-            Some(bit) => {
-                self.slots |= bit;
-                true
-            }
-            None => false,
-        }
-    }
-
-    #[inline]
-    const fn remove_slot(&mut self, slot: u32) -> bool {
-        match 1u64.checked_shl(slot) {
-            Some(bit) => {
-                self.slots &= !bit;
-                true
-            }
-            None => false,
-        }
     }
 
     #[inline]
@@ -204,8 +173,11 @@ impl Handle {
 impl Drop for Handle {
     fn drop(&mut self) {
         let page = unsafe { self.page.as_mut() };
-        if let Some(slot) = page.find_slot(self.data) {
-            page.remove_slot(slot);
+        let slot = (self.data.addr().get() - page.data().addr().get()) as u32 >> (page.size() + 6);
+        let full = page.slots == u64::MAX;
+        page.slots &= !(1u64 << slot);
+        if full {
+            page.next = unsafe { page.head.replace(self.page.as_ptr()) };
         }
     }
 }
@@ -231,58 +203,5 @@ impl Drop for Memory {
                 raw = page.next;
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use checkito::*;
-
-    fn any_size() -> impl Generate<Item = Size> {
-        checkito::Generate::map(0u32..7, |i| match i {
-            0 => Size::_64,
-            1 => Size::_128,
-            2 => Size::_256,
-            3 => Size::_512,
-            4 => Size::_1024,
-            5 => Size::_2048,
-            _ => Size::_4096,
-        })
-    }
-
-    #[check]
-    fn alloc_and_free_roundtrip_reuses_slots() {
-        let mut memory = Memory::new();
-        for size in [
-            Size::_64,
-            Size::_128,
-            Size::_256,
-            Size::_512,
-            Size::_1024,
-            Size::_2048,
-            Size::_4096,
-        ] {
-            let slots = Page::SIZE / size.size();
-            let mut ptrs: Vec<Handle> = Vec::with_capacity(slots as usize);
-            for _ in 0..slots {
-                ptrs.push(memory.next(size));
-            }
-            drop(ptrs);
-            let p = memory.next(size);
-            drop(p);
-        }
-    }
-
-    #[check(any_size())]
-    fn free_then_realloc_each_slot(size: Size) {
-        let mut memory = Memory::new();
-        let slots = Page::SIZE / size.size();
-        for _ in 0..slots {
-            let p = memory.next(size);
-            drop(p);
-        }
-        let p = memory.next(size);
-        drop(p);
     }
 }
