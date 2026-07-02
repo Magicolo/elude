@@ -57,22 +57,10 @@ impl Size {
 }
 
 impl Memory {
-    const LAYOUT: Layout =
-        unsafe { Layout::from_size_align_unchecked(Self::SIZE as _, Self::SIZE as _) };
-    const SIZE: u32 = 4096;
-
     pub const fn new() -> Self {
         Self {
             pages: [null_mut(); 7],
         }
-    }
-
-    /// Sets the upper bits of the slots to 1 for a given size. This is used to
-    /// mark the slots as unavailable for allocation.
-    #[inline]
-    const fn mask(size: u32) -> u64 {
-        let shift = Self::SIZE.saturating_div(size);
-        !1u64.unbounded_shl(shift).wrapping_sub(1)
     }
 
     pub fn next(&mut self, size: Size) -> Handle {
@@ -88,26 +76,40 @@ impl Memory {
             }
         }
 
-        let data = match NonNull::new(unsafe { alloc(Self::LAYOUT) }) {
-            Some(data) => Page::add_size(data, size.index()),
-            None => handle_alloc_error(Self::LAYOUT),
-        };
-        let page = Box::into_raw(Box::new(Page {
-            data,
-            slots: Self::mask(size.size()) | 1,
-            next: *head,
-        }));
+        let mut page = Page::new(size);
+        page.next = *head;
+        page.add_slot(0);
+        let page = Box::into_raw(Box::new(page));
         *head = page;
-
-        Handle {
-            page: unsafe { NonNull::new_unchecked(page) },
-            slot: 1,
-        }
+        let page = unsafe { NonNull::new_unchecked(page) };
+        Handle { page, slot: 0 }
     }
 }
 
 impl Page {
+    const LAYOUT: Layout =
+        unsafe { Layout::from_size_align_unchecked(Self::SIZE as _, Self::SIZE as _) };
     const MASK: usize = 0b1111;
+    const SIZE: u32 = 4096;
+
+    pub fn new(size: Size) -> Self {
+        Self {
+            data: match NonNull::new(unsafe { alloc(Self::LAYOUT) }) {
+                Some(data) => Self::add_size(data, size.index()),
+                None => handle_alloc_error(Self::LAYOUT),
+            },
+            slots: Self::mask(size.size()),
+            next: null_mut(),
+        }
+    }
+
+    /// Sets the upper bits of the slots to 1 for a given size. This is used to
+    /// mark the slots as unavailable for allocation.
+    #[inline]
+    const fn mask(size: u32) -> u64 {
+        let shift = Self::SIZE.saturating_div(size);
+        !1u64.unbounded_shl(shift).wrapping_sub(1)
+    }
 
     #[inline]
     pub fn size(&self) -> u32 {
@@ -192,14 +194,19 @@ impl Default for Memory {
     }
 }
 
+impl Drop for Page {
+    fn drop(&mut self) {
+        unsafe { dealloc(self.data().as_ptr(), Self::LAYOUT) };
+    }
+}
+
 impl Drop for Memory {
     fn drop(&mut self) {
         for head in self.pages.iter_mut() {
             let mut raw = *head;
-            while !raw.is_null() {
-                let page = unsafe { Box::from_raw(raw) };
+            while let Some(page) = NonNull::new(raw) {
+                let page = unsafe { Box::from_raw(page.as_ptr()) };
                 raw = page.next;
-                unsafe { dealloc(page.data.as_ptr(), Self::LAYOUT) };
             }
         }
     }
@@ -234,7 +241,7 @@ mod tests {
             Size::_2048,
             Size::_4096,
         ] {
-            let slots = Memory::SIZE / size.size();
+            let slots = Page::SIZE / size.size();
             let mut ptrs: Vec<Handle> = Vec::with_capacity(slots as usize);
             for _ in 0..slots {
                 ptrs.push(memory.next(size));
@@ -248,7 +255,7 @@ mod tests {
     #[check(any_size())]
     fn free_then_realloc_each_slot(size: Size) {
         let mut memory = Memory::new();
-        let slots = Memory::SIZE / size.size();
+        let slots = Page::SIZE / size.size();
         for _ in 0..slots {
             let p = memory.next(size);
             drop(p);
