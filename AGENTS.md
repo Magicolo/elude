@@ -20,9 +20,8 @@ mandatory part of every non-trivial task, not an afterthought.
 
 `elude` is a Rust 2024 columnar data library (MIT, MSRV 1.85). It provides:
 
-- A **lock-free page pool** with per-thread Treiber stacks, tagged-pointer ABA
-  counters, local caches, and batch push/pop (`memory.rs`).
-- A **mutex-guarded page pool** fallback (`simple_memory.rs`).
+- A **mutex-guarded page pool** prototype (`memory1` — simple, fallible `Result`-based).
+- A **lock-free page pool** prototype (`memory2` — atomic, infallible via `handle_alloc_error`).
 - A **type-level schema system** with pre-computed page capacity (`schema`).
 - A **columnar table layout** with concurrent locking protocol (`table`).
 - A **query builder** with planned join support (`query`).
@@ -49,7 +48,10 @@ elude (workspace root — re-exports)
 ├── .github/
 │   ├── workflows/test.yml    — CI: single matrix job (build, test, clippy, fmt, doc, miri, deny, cov, msrv, dupe, semver-checks)
 │   └── dependabot.yml        — Weekly dependency updates
-├── elude_core/src/           — Core library source
+├── elude_core/src/
+│   ├── memory1.rs            — Mutex-guarded page pool
+│   ├── memory2.rs            — Lock-free page pool
+│   └── ...                   — Core library source
 ├── elude_core/benches/       — Criterion benchmarks
 ├── elude_macro/src/          — Proc-macro source
 ├── elude_legacy/             — publish=false, legacy experiments/benchmarks
@@ -115,7 +117,9 @@ These destructively hide or rewrite state. If one seems necessary, ask the user.
 ### Naming
 
 - Full descriptive names. No abbreviations except established domain terms
-  (`ABA`, `CAS`, `OOM`).
+  (`ABA`, `CAS`, `OOM`). For example, use `unavailable_slots_mask` not `mask`,
+  `allocate` not `alloc`, `deallocate` not `dealloc`. This is enforced
+  strictly — even common shorthands like `mask` must be expanded.
 - Prefer names like `flush_all`, `refill_from_head` over `flush`, `refill`.
 
 ### Comments And Documentation
@@ -288,15 +292,24 @@ Not covered: unsupported performance claims without benchmarks, correctness
 without Miri, external system behavior, `#[no_std]` (not yet supported),
 Display/serde (not yet implemented), `elude_legacy` semver (publish=false).
 
-Note: `pop()` panics on OOM via `handle_alloc_error` — intentional. Use
-`try_pop()` if OOM tolerance needed.
+Note: `memory1` and `memory2` are experimental prototypes and are not
+interconnected with the rest of the codebase. `checkito` dev-dependency is used
+for property-based testing (`#[check]` attribute). Use `checkito` when writing
+property-style tests for new allocator-like modules.
+
+Note: `memory1` and `memory2` are structurally similar (both use `[*mut Page; 7]`,
+`u64` slot bitmasks, and raw-pointer linked lists). `memory1::Memory::take()` and
+`memory2::Memory::take()` both panic on OOM via `handle_alloc_error` — intentional.
+`memory1` uses `&mut self` (synchronous via `parking_lot::Mutex`) and explicit
+`put()` for deallocation; `memory2` uses `&self` (lock-free atomics) and automatic
+`Drop` on `Pointer`.
 
 ## Start Here
 
 Read these files first:
 `README.md` → `Cargo.toml` (workspace) → `elude_core/Cargo.toml` →
 `elude_macro/Cargo.toml` → `elude_core/src/lib.rs` →
-`elude_core/src/memory.rs` → `elude_core/src/simple_memory.rs` → `src/lib.rs`
+`elude_core/src/memory1.rs` → `elude_core/src/memory2.rs` → `src/lib.rs`
 
 ## When In Doubt
 

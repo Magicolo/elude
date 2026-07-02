@@ -125,13 +125,9 @@ pub mod index {
 
 pub mod schema {
     use core::{
-        alloc::{Layout, LayoutErr, LayoutError},
+        alloc::{Layout, LayoutError},
         any::TypeId,
-        cell::RefCell,
-        cmp::Reverse,
-        ptr::NonNull,
     };
-    use parking_lot::Mutex;
     use triomphe::ThinArc;
 
     // Header is the maximum row count of each table computed to make a table

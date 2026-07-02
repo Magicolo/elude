@@ -13,4 +13,6 @@ cache_line_size.workspace = true
 page_size.workspace = true
 parking_lot.workspace = true
 triomphe.workspace = true
-thiserror.workspace = true
+
+[dev-dependencies]
+checkito = { version = "5", features = ["checkito_macro"] }
