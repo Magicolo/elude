@@ -10,24 +10,22 @@ use core::{
 // Design
 // ════════════════════════════════════════════════════════════════════
 //
-// Work-stealing page pool.  Each thread has a unique pool head (a
-// single Treiber stack) in a global array.  Threads push to and pop
-// from their own head using the LOCAL cache as a hot buffer.
+// Lock-free page pool.  Each thread has a unique Treiber-stack head
+// in a global array.  Threads push to and pop from their own head
+// using the LOCAL cache as a hot buffer.
 //
 // When a thread's LOCAL cache is empty and its own pool head has no
-// pages, it steals from other threads' pool heads before falling back
-// to OS allocation.  The LOCAL cache is the only hot path — the pool
-// heads are only accessed during flush/refill/steal.
+// pages, it falls back to OS allocation (one page at a time).
+// The LOCAL cache is the only hot path — the pool heads are only
+// accessed during flush/refill.
 //
-// There is NO shared sharded pool and NO cache-line padding.  Each
-// pool head is a plain AtomicUsize (8 bytes).  With 64 pool heads
-// the entire array is 512 bytes, and the Memory struct is ~24 bytes.
+// There is NO shared sharded pool, NO cache-line padding, and NO
+// work-stealing.  Each pool head is a plain AtomicUsize (8 bytes).
+// With 64 pool heads the entire array is 512 bytes, and the Memory
+// struct is ~24 bytes.
 //
-// Since stealing is amortized (one steal per cache-miss, which
-// refills 32 pages), contention on any single head is negligible.
-//
-// "A little waste is acceptable" — try_pop only checks LOCAL + own
-// head, never steals.  Stealing only happens on pop() fallback.
+// "A little waste is acceptable" — try_pop and pop both only check
+// LOCAL + own head, never steal.  OS allocation is the fallback.
 
 // ════════════════════════════════════════════════════════════════════
 // Configuration
@@ -58,7 +56,7 @@ const COUNTER_INCREMENT: usize = 1 << COUNTER_SHIFT;
 
 #[inline(always)]
 fn shift_ptr(ptr: *mut u8) -> usize {
-    ptr.addr() >> PAGE_SHIFT
+    (ptr as usize) >> PAGE_SHIFT
 }
 
 #[inline(always)]
@@ -217,17 +215,12 @@ impl Memory {
                 return page;
             }
 
-            // try_pop missed → steal from other workers' pool heads.
-            let my_id = WORKER_ID.with(|&id| id);
-            for offset in 1..MAX_WORKERS {
-                let id = (my_id + offset) % MAX_WORKERS;
-                if let Some(page) = self.refill_from_head(id) {
-                    return page;
-                }
-            }
-
             // Everyone is empty — fresh-allocate.
-            self.alloc_batch()
+            let ptr = std::alloc::alloc(self.layout);
+            if ptr.is_null() {
+                std::alloc::handle_alloc_error(self.layout);
+            }
+            NonNull::new_unchecked(ptr).cast::<usize>()
         }
     }
 
@@ -333,30 +326,6 @@ impl Memory {
 
                 backoff.snooze();
             }
-        }
-    }
-
-    // ── OS batch allocation ────────────────────────────────────────
-
-    unsafe fn alloc_batch(&self) -> NonNull<usize> {
-        unsafe {
-            let mut batch = [core::ptr::null_mut::<u8>(); BATCH];
-            for page in &mut batch {
-                let ptr = std::alloc::alloc(self.layout);
-                if ptr.is_null() {
-                    std::alloc::handle_alloc_error(self.layout);
-                }
-                *page = ptr;
-            }
-
-            LOCAL.with(|local| {
-                let cache = &mut *local.get();
-                for &p in &batch[1..] {
-                    cache.push(p);
-                }
-            });
-
-            NonNull::new_unchecked(batch[0]).cast::<usize>()
         }
     }
 

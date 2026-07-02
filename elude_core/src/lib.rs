@@ -1,5 +1,55 @@
+use core::{alloc::Layout, ptr::NonNull};
+
 pub mod memory;
 pub mod simple_memory;
+
+/// TODO: Memory allocator.
+///
+/// QUESTIONS:
+/// - Support for arbitrary types as columns?
+///     - At least some standard types like `Box<T>`, `Vec<T>`, etc.
+///     - `Box<T>` has a size of 8 or 16 (fat pointer) bytes, which is
+///       consistent with other column types (`u64`, `u128`).
+///     - `Vec<T>` has a size of 24 bytes... with memory pages of 4kB, there'd
+///       be only 170 rows in the table. Also, 24 is an awkward divider of
+///       powers or 2.
+///         - Could be stored as 16 bytes with `{ len: u32, cap: u32 }`?
+/// - How to efficiently join queries?
+///     - When possible, the join mechanism must use indexes.
+/// - How to define indexes?
+/// - Support for commutative write operations with looser locking semantics?
+///     - Multiple `Add` or `Multiply` operations do not need an exclusive write
+///       lock.
+///     - When the operation for a given column changes (say from `Set` to `Add`
+///       or `Add` to `Multiply`), the new operation will need to block.
+///     - There'd need to be a way to save the current operation for each
+///       column.
+struct Chunk {
+    data: NonNull<u8>,
+    // Each bit represents a chunk in the page.
+    slots: u32,
+    // Next page of the same size.
+    next: u32,
+}
+
+struct Memory {
+    pages: Vec<Chunk>,
+    // First page for each size.
+    heads: [u32; 5],
+    layout: Layout,
+}
+
+impl Memory {
+    fn new() -> Self {
+        let page = page_size::get();
+        let layout = unsafe { Layout::from_size_align_unchecked(page, page) };
+        Self {
+            pages: Vec::new(),
+            heads: [u32::MAX; 5],
+            layout,
+        }
+    }
+}
 
 pub trait Table {
     type Store;
@@ -85,8 +135,32 @@ impl<C: Column> Table for C {
 impl Column for usize {}
 impl Column for f32 {}
 
+pub struct Store {
+    keys: key::Keys,
+    tables: table::Tables,
+    indexes: index::Indexes,
+    schemas: schema::Schemas,
+}
+
+pub mod key {
+    pub struct Key;
+    pub struct Keys;
+}
+
+pub mod index {
+    pub struct Index;
+    pub struct Indexes;
+}
+
 pub mod schema {
-    use core::alloc::Layout;
+    use core::{
+        alloc::{Layout, LayoutErr, LayoutError},
+        any::TypeId,
+        cell::RefCell,
+        cmp::Reverse,
+        ptr::NonNull,
+    };
+    use parking_lot::Mutex;
     use triomphe::ThinArc;
 
     // Header is the maximum row count of each table computed to make a table
@@ -95,11 +169,13 @@ pub mod schema {
     #[derive(Clone)]
     pub struct Schema(ThinArc<Header, Column>);
 
+    pub struct Schemas;
+
     pub struct Header {
         capacity: u32,
     }
 
-    #[derive(Clone, Copy)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
     pub enum Type {
         Bool,
         Char,
@@ -119,18 +195,124 @@ pub mod schema {
         F64,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
     pub struct Column {
         r#type: Type,
         path: Path,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
     pub struct Path;
 
     impl Schema {
-        pub fn layout(&self, count: u32) -> Layout {
-            todo!()
+        pub fn new(columns: impl IntoIterator<Item = Column>) -> Self {
+            let page = page_size::get();
+            let mut columns = columns.into_iter().collect::<Vec<_>>();
+            columns
+                .sort_unstable_by_key(|column| (column.r#type.size(), column.r#type.identifier()));
+            columns.dedup_by_key(|column| (column.r#type.size(), column.r#type.identifier()));
+            let capacity = columns
+                .last()
+                .and_then(|column| page.checked_div(column.r#type.size())?.try_into().ok())
+                .unwrap_or(u32::MAX);
+            Self(ThinArc::from_header_and_iter(
+                Header { capacity },
+                columns.into_iter(),
+            ))
         }
     }
+
+    impl Type {
+        #[inline]
+        pub const fn identifier(self) -> TypeId {
+            match self {
+                Self::Bool => TypeId::of::<bool>(),
+                Self::Char => TypeId::of::<char>(),
+                Self::U8 => TypeId::of::<u8>(),
+                Self::U16 => TypeId::of::<u16>(),
+                Self::U32 => TypeId::of::<u32>(),
+                Self::U64 => TypeId::of::<u64>(),
+                Self::U128 => TypeId::of::<u128>(),
+                Self::Usize => TypeId::of::<usize>(),
+                Self::I8 => TypeId::of::<i8>(),
+                Self::I16 => TypeId::of::<i16>(),
+                Self::I32 => TypeId::of::<i32>(),
+                Self::I64 => TypeId::of::<i64>(),
+                Self::I128 => TypeId::of::<i128>(),
+                Self::Isize => TypeId::of::<isize>(),
+                Self::F32 => TypeId::of::<f32>(),
+                Self::F64 => TypeId::of::<f64>(),
+            }
+        }
+
+        #[inline]
+        pub const fn layout(self, count: usize) -> Result<Layout, LayoutError> {
+            match self {
+                Self::Bool => Layout::array::<bool>(count),
+                Self::Char => Layout::array::<char>(count),
+                Self::U8 => Layout::array::<u8>(count),
+                Self::U16 => Layout::array::<u16>(count),
+                Self::U32 => Layout::array::<u32>(count),
+                Self::U64 => Layout::array::<u64>(count),
+                Self::U128 => Layout::array::<u128>(count),
+                Self::Usize => Layout::array::<usize>(count),
+                Self::I8 => Layout::array::<i8>(count),
+                Self::I16 => Layout::array::<i16>(count),
+                Self::I32 => Layout::array::<i32>(count),
+                Self::I64 => Layout::array::<i64>(count),
+                Self::I128 => Layout::array::<i128>(count),
+                Self::Isize => Layout::array::<isize>(count),
+                Self::F32 => Layout::array::<f32>(count),
+                Self::F64 => Layout::array::<f64>(count),
+            }
+        }
+
+        #[inline]
+        pub const fn size(self) -> usize {
+            match self {
+                Self::Bool => size_of::<bool>(),
+                Self::Char => size_of::<char>(),
+                Self::U8 => size_of::<u8>(),
+                Self::U16 => size_of::<u16>(),
+                Self::U32 => size_of::<u32>(),
+                Self::U64 => size_of::<u64>(),
+                Self::U128 => size_of::<u128>(),
+                Self::Usize => size_of::<usize>(),
+                Self::I8 => size_of::<i8>(),
+                Self::I16 => size_of::<i16>(),
+                Self::I32 => size_of::<i32>(),
+                Self::I64 => size_of::<i64>(),
+                Self::I128 => size_of::<i128>(),
+                Self::Isize => size_of::<isize>(),
+                Self::F32 => size_of::<f32>(),
+                Self::F64 => size_of::<f64>(),
+            }
+        }
+    }
+}
+
+pub mod query {
+    /// TODO: To join queries, define `Query::join(on: Path, queries:
+    /// (Query<Q0>, Query<Q1>, ...))`.
+    ///     - Note that with this algorithm, it should be possible to join any
+    ///       number of queries, not just 2.
+    ///     - Ensure that the `on` and `queries` do not have read-write or
+    ///       write-write conflicts between each other such that they can not
+    ///       create deadlocks, UB or inconsistent behavior.
+    ///     - Take read locks on all of the join key columns on all tables
+    ///       covered by the queries (note that there may be some table overlap
+    ///       between queries and that is ok); locks will be taken incrementally
+    ///       with a `try_lock` strategy (be sure to avoid deadlocks).
+    ///     - Build a map from the keys that intersect all the queries and a
+    ///       `Map<Key, (Row(table0, row0), Row(table1, row1), ...)>`.
+    ///     - Iterate on the map values and yield the joined rows. Accumulate
+    ///       the locks on the visited tables rather than potentially locking
+    ///       and unlocking for each yielded row (with a `try_lock` strategy?);
+    ///       perhaps keep a count of how many rows will be yielded for each
+    ///       table and release the locks for exhausted tables early (including
+    ///       the join key lock).
+    ///     - Release all remaining table locks, if any.
+    struct Query;
 }
 
 pub mod table {
@@ -269,53 +451,6 @@ pub mod table {
         copy_mask: u64,
         data: NonNull<u8>,
     }
-
-    // impl Header {
-    //     pub fn lock(&self, mask: u64) {
-    //         // TODO: Check ordering.
-    //         let mut old = self.lock.load(Ordering::Relaxed);
-    //         loop {
-    //             if old & mask == 0 {
-    //                 match self.lock.compare_exchange_weak(
-    //                     old,
-    //                     old | mask,
-    //                     Ordering::Relaxed,
-    //                     Ordering::Relaxed,
-    //                 ) {
-    //                     Ok(_) => break,
-    //                     Err(new) => old = new,
-    //                 }
-    //             }
-    //             // TODO: Wait. Use `atomic-wait` and an `AtomicU32`?
-    //         }
-    //     }
-
-    //     pub fn try_lock(&self, mask: u64) -> bool {
-    //         // TODO: Check ordering.
-    //         let old = self.lock.load(Ordering::Relaxed);
-    //         if old & mask == 0 {
-    //             match self.lock.compare_exchange_weak(
-    //                 old,
-    //                 old | mask,
-    //                 Ordering::Relaxed,
-    //                 Ordering::Relaxed,
-    //             ) {
-    //                 Ok(_) => true,
-    //                 Err(_) => false,
-    //             }
-    //         } else {
-    //             false
-    //         }
-    //     }
-
-    //     pub unsafe fn unlock(&self, mask: u64) {
-    //         self.lock.fetch_and(!mask, Ordering::Relaxed);
-    //     }
-    // }
-
-    impl State {
-        pub fn boba(&mut self) {}
-    }
 }
 
 /*
@@ -342,12 +477,13 @@ let mut query = Query::builder()
     // Field can also be indexed; useful for tuple structures.
     // - Using a `&str` is a shorthand for `Any::field("position")`.
     // - Using a `usize` is a shorthand for `Any::index(0)`.
-    .write(Path::any().then("position").then(0))
-    // `Path::any` will match any root.
+    .write(Path::new().then(Any).then("position").then(0))
+    .write(Path::new().then(Any).then(Any).then("x").cast::<f32>())
+    // `Any` will match any root.
     // As soon as a type is provided, strongly typed paths can be used again.
-    .read(Path::any().then(Vector3::field("position")).x())
+    .read(Path::new().then(Any).then(Vector3::field("position")).x())
     // Static paths might be generated.
-    .read(Path::any().then(Player::position()))
+    .read(Path::new().then(Any).then(Player::position()))
     // `try_` variants will yield `Some/None` based on the presence of the column.
     .try_write(Path::any().then(Vector3::index(0)).x())
     .has(Path::any().field("health"))
@@ -363,7 +499,3 @@ for table in query.tables() {
     }
 }
  */
-
-fn _boba() {
-    let _a = <Player as Table>::Store::default();
-}
