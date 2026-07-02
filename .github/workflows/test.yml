@@ -1,0 +1,34 @@
+name: test
+
+on:
+    push:
+        branches: ["main"]
+    pull_request:
+        branches: ["main"]
+
+jobs:
+    test:
+        runs-on: ubuntu-latest
+        container:
+            image: ghcr.io/magicolo/rust
+        env:
+            RUSTDOCFLAGS: '-D warnings'
+        strategy:
+            matrix:
+                command:
+                    - cargo hack build --workspace --feature-powerset
+                    - cargo hack nextest run --workspace --feature-powerset --no-tests pass
+                    - cargo hack clippy --workspace --feature-powerset -- -D warnings
+                    - cargo +nightly fmt --all --check
+                    - cargo doc --no-deps --release --all-features --workspace
+                    - cargo miri nextest run --workspace --all-features
+                    - cargo deny check advisories
+                    - cargo deny check bans
+                    - cargo llvm-cov nextest --workspace --all-features --fail-under-regions 50
+                    - cargo msrv verify --workspace
+                    - cargo dupe
+                    - cargo sort --check --workspace
+                    - cargo semver-checks --workspace
+        steps:
+            - uses: actions/checkout@v6
+            - run: ${{ matrix.command }}
