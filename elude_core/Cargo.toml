@@ -13,16 +13,4 @@ cache_line_size.workspace = true
 page_size.workspace = true
 parking_lot.workspace = true
 triomphe.workspace = true
-
-[dev-dependencies]
-criterion.workspace = true
-
-[[bench]]
-name = "memory"
-path = "benches/memory.rs"
-harness = false
-
-[[bench]]
-name = "comparison"
-path = "benches/comparison.rs"
-harness = false
+thiserror.workspace = true

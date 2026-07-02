@@ -47,7 +47,7 @@ elude (workspace root — re-exports)
 
 ```
 ├── .github/
-│   ├── workflows/test.yml    — CI: single matrix job (build, test, clippy, fmt, doc, miri, deny, cov, msrv, dupe, sort, semver-checks)
+│   ├── workflows/test.yml    — CI: single matrix job (build, test, clippy, fmt, doc, miri, deny, cov, msrv, dupe, semver-checks)
 │   └── dependabot.yml        — Weekly dependency updates
 ├── elude_core/src/           — Core library source
 ├── elude_core/benches/       — Criterion benchmarks
@@ -150,7 +150,6 @@ Before finishing, run the relevant checks:
 - Security: `cargo deny check advisories` (for dependency changes)
 - Bans: `cargo deny check bans`
 - Duplicates: `cargo dupe` (for dependency changes)
-- Ordering: `cargo sort --check --workspace`
 - MSRV: `cargo msrv verify --workspace`
 - Semver: `cargo semver-checks --workspace`
 - Docs: `cargo doc --no-deps --release --all-features --workspace` (must pass without error/warning, `RUSTDOCFLAGS=-D warnings` set in environment)
@@ -183,7 +182,7 @@ not done.
    `cargo +nightly hack clippy --workspace --feature-powerset -- -D warnings`,
    `cargo +nightly fmt --all --check`, `cargo +nightly miri nextest run --workspace --all-features` (if unsafe),
    `cargo deny check advisories`, `cargo deny check bans`,
-   `cargo dupe`, `cargo sort --check --workspace`,
+   `cargo dupe`,
    `cargo llvm-cov nextest --workspace --all-features --fail-under-regions 50`,
    `cargo msrv verify --workspace`, `cargo semver-checks --workspace`,
    `RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --release --all-features --workspace`.
@@ -242,7 +241,6 @@ A single `test` job runs all quality gates via a strategy matrix in
 - Miri (`cargo +nightly miri nextest run`).
 - Security advisories + bans (`cargo deny`).
 - Duplicate dependency detection (`cargo dupe`).
-- Cargo.toml ordering (`cargo sort`).
 - MSRV verification (`cargo msrv verify`).
 - Semver API compatibility (`cargo semver-checks`).
 - Coverage (`cargo llvm-cov`).

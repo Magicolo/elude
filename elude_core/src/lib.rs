@@ -1,55 +1,26 @@
-use core::{alloc::Layout, ptr::NonNull};
+pub mod memory1;
+pub mod memory2;
 
-pub mod memory;
-pub mod simple_memory;
-
-/// TODO: Memory allocator.
-///
-/// QUESTIONS:
-/// - Support for arbitrary types as columns?
-///     - At least some standard types like `Box<T>`, `Vec<T>`, etc.
-///     - `Box<T>` has a size of 8 or 16 (fat pointer) bytes, which is
-///       consistent with other column types (`u64`, `u128`).
-///     - `Vec<T>` has a size of 24 bytes... with memory pages of 4kB, there'd
-///       be only 170 rows in the table. Also, 24 is an awkward divider of
-///       powers or 2.
-///         - Could be stored as 16 bytes with `{ len: u32, cap: u32 }`?
-/// - How to efficiently join queries?
-///     - When possible, the join mechanism must use indexes.
-/// - How to define indexes?
-/// - Support for commutative write operations with looser locking semantics?
-///     - Multiple `Add` or `Multiply` operations do not need an exclusive write
-///       lock.
-///     - When the operation for a given column changes (say from `Set` to `Add`
-///       or `Add` to `Multiply`), the new operation will need to block.
-///     - There'd need to be a way to save the current operation for each
-///       column.
-struct Chunk {
-    data: NonNull<u8>,
-    // Each bit represents a chunk in the page.
-    slots: u32,
-    // Next page of the same size.
-    next: u32,
-}
-
-struct Memory {
-    pages: Vec<Chunk>,
-    // First page for each size.
-    heads: [u32; 5],
-    layout: Layout,
-}
-
-impl Memory {
-    fn new() -> Self {
-        let page = page_size::get();
-        let layout = unsafe { Layout::from_size_align_unchecked(page, page) };
-        Self {
-            pages: Vec::new(),
-            heads: [u32::MAX; 5],
-            layout,
-        }
-    }
-}
+/* TODO: Memory allocator.
+ QUESTIONS:
+ - Support for arbitrary types as columns?
+     - At least some standard types like `Box<T>`, `Vec<T>`, etc.
+     - `Box<T>` has a size of 8 or 16 (fat pointer) bytes, which is
+       consistent with other column types (`u64`, `u128`).
+     - `Vec<T>` has a size of 24 bytes... with memory pages of 4kB, there'd
+       be only 170 rows in the table. Also, 24 is an awkward divider of
+       powers or 2.
+         - Could be stored as 16 bytes with `{ len: u32, cap: u32 }`?
+ - How to efficiently join queries?
+     - When possible, the join mechanism must use indexes.
+ - How to define indexes?
+ - Support for commutative write operations with looser locking semantics?
+     - Multiple `Add` or `Multiply` operations do not need an exclusive write
+       lock.
+     - When the operation for a given column changes (say from `Set` to `Add`
+       or `Add` to `Multiply`), the new operation will need to block.
+     - There'd need to be a way to save the current operation for each column.
+*/
 
 pub trait Table {
     type Store;
@@ -498,4 +469,4 @@ for table in query.tables() {
         }
     }
 }
- */
+*/

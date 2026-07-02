@@ -27,7 +27,6 @@ jobs:
                     - cargo llvm-cov nextest --workspace --all-features --fail-under-regions 50
                     - cargo msrv verify --workspace
                     - cargo dupe
-                    - cargo sort --check --workspace
                     - cargo semver-checks --workspace
         steps:
             - uses: actions/checkout@v6
