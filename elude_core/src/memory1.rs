@@ -4,6 +4,12 @@ use core::{
     ptr::{null_mut, NonNull},
 };
 use std::alloc::{alloc, dealloc, handle_alloc_error};
+/*
+    TODO: Unlink pages that have become full from the linked list. Relink them when the `Handle` is dropped.
+    - On `next()`, if the page has become full, unlink it.
+    - On `Handle::drop()`, relink the page if it was full.
+    - This means that the head pointers in `Memory` always have at least one slot available.
+*/
 
 pub struct Page {
     data: NonNull<u8>,
@@ -14,8 +20,8 @@ pub struct Page {
 }
 
 pub struct Handle {
+    data: NonNull<u8>,
     page: NonNull<Page>,
-    slot: u32,
 }
 
 pub struct Memory {
@@ -70,19 +76,23 @@ impl Memory {
             let page = unsafe { raw.as_mut() };
             let slot = page.next_slot();
             if page.add_slot(slot) {
-                return Handle { page: raw, slot };
+                return Handle {
+                    data: page.get_slot(slot),
+                    page: raw,
+                };
             } else {
                 current = &mut page.next;
             }
         }
 
         let mut page = Page::new(size);
+        let data = page.data();
         page.next = *head;
         page.add_slot(0);
         let page = Box::into_raw(Box::new(page));
         *head = page;
         let page = unsafe { NonNull::new_unchecked(page) };
-        Handle { page, slot: 0 }
+        Handle { data, page }
     }
 }
 
@@ -124,6 +134,15 @@ impl Page {
     #[inline]
     pub fn get_slot(&self, slot: u32) -> NonNull<u8> {
         unsafe { self.data().add((self.size() * slot) as usize) }
+    }
+
+    fn find_slot(&self, data: NonNull<u8>) -> Option<u32> {
+        data.addr()
+            .get()
+            .checked_sub(self.data().addr().get())?
+            .checked_div(self.size() as usize)?
+            .try_into()
+            .ok()
     }
 
     #[inline]
@@ -177,14 +196,17 @@ impl Page {
 
 impl Handle {
     #[inline]
-    pub fn get(&self) -> NonNull<u8> {
-        unsafe { self.page.as_ref().get_slot(self.slot) }
+    pub const fn get(&self) -> NonNull<u8> {
+        self.data
     }
 }
 
 impl Drop for Handle {
     fn drop(&mut self) {
-        unsafe { self.page.as_mut() }.remove_slot(self.slot);
+        let page = unsafe { self.page.as_mut() };
+        if let Some(slot) = page.find_slot(self.data) {
+            page.remove_slot(slot);
+        }
     }
 }
 
