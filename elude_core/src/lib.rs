@@ -1,5 +1,4 @@
-pub mod memory1;
-pub mod memory2;
+pub mod memory;
 
 /* TODO: Memory allocator.
  QUESTIONS:
@@ -173,7 +172,8 @@ pub mod schema {
 
     impl Schema {
         pub fn new(columns: impl IntoIterator<Item = Column>) -> Self {
-            let page = page_size::get();
+            // TODO: Do we keep this constant?
+            let page = 4096usize;
             let mut columns = columns.into_iter().collect::<Vec<_>>();
             columns
                 .sort_unstable_by_key(|column| (column.r#type.size(), column.r#type.identifier()));
