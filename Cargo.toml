@@ -16,7 +16,7 @@ bumpalo = "3.20.3"
 cache_line_size = "1.0.0"
 criterion = { version = "0.8", features = ["html_reports"] }
 crossbeam-utils = "0.8.22"
-parking_lot = "0.12.5"
+parking_lot = "0.13.0"
 triomphe = { version = "0.1.16", features = ["arc-swap"] }
 thiserror = "2.0.19"
 
